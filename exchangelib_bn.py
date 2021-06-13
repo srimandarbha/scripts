@@ -18,3 +18,7 @@ if unread_list.count() > 0:
         mail.save()
 
 print(mail_queue_list)
+#soup.select('td div table tbody tr td div')[1].text
+#soup.select('p strong')[0].text
+#m=soup.select('div div table tbody td div')[5] 
+#m.find('strong',text='Assigned To: ').next_sibling
