@@ -1,0 +1,63 @@
+func FetchNodeDetails(instanceMap map[string]InstanceDetails) (ResultsList, error) {
+    hardwareChan := make(chan EndpointResponse)
+    systemDetailChan := make(chan EndpointNodeDetail)
+    var wg sync.WaitGroup
+
+    for _, instance := range instanceMap {
+        instance := instance // Ensure a new instance variable is used for the goroutine
+        wg.Add(1)
+        go func(instance InstanceDetails) {
+            defer wg.Done()
+            hardwareURL := instance.Url + "/rest/v1/endpoints/hardware"
+
+            // Fetch hardware details
+            body, err := GetRequest(hardwareURL, instance.Token)
+            GetError(err, "Error fetching hardware details:")
+            
+            var hardwareResponse EndpointResponse
+            err = json.Unmarshal(body, &hardwareResponse)
+            GetError(err, "Error unmarshalling hardware response:")
+            
+            hardwareChan <- hardwareResponse
+        }(instance)
+    }
+
+    go func() {
+        wg.Wait()
+        close(hardwareChan)
+    }()
+
+    var innerWg sync.WaitGroup
+
+    go func() {
+        for hardwareResponse := range hardwareChan {
+            for _, system := range hardwareResponse.Items {
+                system := system // Ensure a new system variable is used for the goroutine
+                innerWg.Add(1)
+                go func(systemID string, instance InstanceDetails) {
+                    defer innerWg.Done()
+                    systemDetailURL := fmt.Sprintf("%s/%s", instance.Url+"/rest/v1/endpoint", systemID)
+                    body, err := GetRequest(systemDetailURL, instance.Token)
+                    CheckErr(err)
+                    
+                    var systemDetail EndpointNodeDetail
+                    err = json.Unmarshal(body, &systemDetail)
+                    GetError(err, "Error unmarshalling system detail:")
+                    
+                    systemDetailChan <- systemDetail
+                }(system.SystemID, instance)
+            }
+        }
+
+        innerWg.Wait()
+        close(systemDetailChan)
+    }()
+
+    var nodedetails ResultsList
+
+    for systemDetail := range systemDetailChan {
+        nodedetails = append(nodedetails, systemDetail)
+    }
+
+    return nodedetails, nil
+}
