@@ -1,0 +1,98 @@
+Here is a Go script that uses the tcpdump command to capture data and write it to a text file in ASCII format. The script checks the file size and nullifies the file once it reaches 500 MB.
+
+package main
+
+import (
+    "bufio"
+    "fmt"
+    "os"
+    "os/exec"
+    "strconv"
+)
+
+const fileSizeLimit = 500 * 1024 * 1024 // 500 MB
+
+func main() {
+    fileName := "tcpdump_output.txt"
+
+    // Run tcpdump command to capture on the ens32 interface, port 162, in ASCII format
+    cmd := exec.Command("tcpdump", "-i", "ens32", "-s", "0", "-A", "port", "162")
+
+    // Create or open file for writing
+    file, err := os.OpenFile(fileName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+    if err != nil {
+        fmt.Println("Error opening file:", err)
+        return
+    }
+    defer file.Close()
+
+    // Get stdout pipe from tcpdump command
+    stdout, err := cmd.StdoutPipe()
+    if err != nil {
+        fmt.Println("Error getting stdout:", err)
+        return
+    }
+
+    // Start tcpdump command
+    if err := cmd.Start(); err != nil {
+        fmt.Println("Error starting tcpdump:", err)
+        return
+    }
+
+    writer := bufio.NewWriter(file)
+    scanner := bufio.NewScanner(stdout)
+
+    for scanner.Scan() {
+        line := scanner.Text()
+
+        // Write data to the file
+        writer.WriteString(line + "\n")
+        writer.Flush()
+
+        // Check if file size exceeds limit
+        if fileSizeExceeded(fileName) {
+            // Truncate the file when size exceeds 500 MB
+            file.Truncate(0)
+            file.Seek(0, 0)
+        }
+    }
+
+    // Check for errors during reading
+    if err := scanner.Err(); err != nil {
+        fmt.Println("Error reading tcpdump output:", err)
+    }
+
+    // Wait for the command to finish
+    cmd.Wait()
+}
+
+// fileSizeExceeded checks if the file has exceeded the defined size limit
+func fileSizeExceeded(fileName string) bool {
+    fileInfo, err := os.Stat(fileName)
+    if err != nil {
+        fmt.Println("Error getting file info:", err)
+        return false
+    }
+
+    return fileInfo.Size() >= fileSizeLimit
+}
+
+Key Points:
+
+1. exec.Command: Executes tcpdump command on interface ens32 listening on port 162 and writes in ASCII format.
+
+
+2. File Size Check: The script continuously checks if the file size exceeds 500 MB and truncates the file if necessary.
+
+
+3. Buffering: It buffers the tcpdump output and writes to the file efficiently.
+
+
+
+To run this:
+
+Save the code as tcpdump.go.
+
+Run it with go run tcpdump.go.
+
+
