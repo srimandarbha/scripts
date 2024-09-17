@@ -1,46 +1,86 @@
-Enhancing Resiliency: Uniform PSU Firmware Upgrades Across 1500+ Servers with RIBCL
+Here is a C program using pcap.h to listen for SNMP data on port 162 on the ens32 interface and write the captured data to a text file. The program also checks the file size and resets it when it reaches 500 MB.
 
-As part of our ongoing mission to bolster service resilience, we’ve been focused on ensuring the reliability of our hardware infrastructure, particularly the PSU (Power Supply Unit) firmware in our HP Gen9 devices. While previous automation efforts using Tanium and hpconfig.pl have been effective for Linux and Windows platforms, they fell short when it came to ESXi, leaving us vulnerable to potential power supply faults due to outdated firmware.
+#include <stdio.h>
+#include <pcap.h>
+#include <stdlib.h>
+#include <string.h>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
 
-This article outlines how the integration of Remote Insight Board Command Language (RIBCL) into our automation framework has significantly enhanced our resiliency strategy. By adopting RIBCL, we’ve established a uniform approach to PSU firmware upgrades across all platforms—Linux, Windows, and ESXi—ensuring that our entire estate benefits from the latest firmware and avoiding the risks associated with power supply faults.
+#define SNAP_LEN 1518
+#define SIZE_LIMIT 500 * 1024 * 1024  // 500 MB
 
-WHY: Ensuring Resiliency Through Uniform Automation
+void packet_handler(u_char *user_data, const struct pcap_pkthdr *pkthdr, const u_char *packet) {
+    static long file_size = 0;
+    FILE *file = (FILE *)user_data;
 
-Resiliency in our infrastructure is non-negotiable, particularly in ensuring that all server PSUs are operating with the latest firmware. The potential risks of power supply faults due to outdated firmware are too significant to ignore. Initially, our automation efforts using Tanium and hpconfig.pl were limited to Linux and Windows platforms, requiring manual intervention for ESXi servers—a gap that compromised our resiliency goals.
+    // Write packet data to the file
+    fwrite(packet, pkthdr->len, 1, file);
+    file_size += pkthdr->len;
 
-Key Objectives:
+    // Check if the file has reached the size limit
+    if (file_size >= SIZE_LIMIT) {
+        // Reset the file by reopening it (null out)
+        freopen("snmp_data.txt", "w", file);
+        file_size = 0;
+    }
+}
 
-    Achieve Uniformity: Establish a consistent process for upgrading PSU firmware across all platforms to ensure no device is left vulnerable.
-    Enhance Resiliency: Eliminate the risk of power supply faults by ensuring all servers are running the latest firmware.
-    Reduce Operational Burden: Minimize manual intervention, reducing TPAM requests and freeing up human resources for other critical tasks.
+int main() {
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t *handle;
 
-WHAT: RIBCL and Automation Across 1500+ Servers
+    // Open the ens32 interface
+    handle = pcap_open_live("ens32", SNAP_LEN, 1, 1000, errbuf);
+    if (handle == NULL) {
+        fprintf(stderr, "Could not open device: %s\n", errbuf);
+        return 2;
+    }
 
-To achieve our resiliency goals, we adopted RIBCL, a tool that enables out-of-band management of HP iLO interfaces, to automate PSU firmware upgrades across our entire server estate, including ESXi servers. This approach allowed us to complete upgrades on over 1500 servers within two months, ensuring that our entire infrastructure is resilient against power supply faults.
+    // Compile the filter for port 162 (SNMP trap) and UDP protocol
+    struct bpf_program fp;
+    char filter_exp[] = "udp port 162";
+    if (pcap_compile(handle, &fp, filter_exp, 0, PCAP_NETMASK_UNKNOWN) == -1) {
+        fprintf(stderr, "Could not parse filter: %s\n", pcap_geterr(handle));
+        return 2;
+    }
+    if (pcap_setfilter(handle, &fp) == -1) {
+        fprintf(stderr, "Could not install filter: %s\n", pcap_geterr(handle));
+        return 2;
+    }
 
-Results:
+    // Open file for writing
+    FILE *file = fopen("snmp_data.txt", "w");
+    if (!file) {
+        perror("Could not open file");
+        return 1;
+    }
 
-    Resiliency Enhanced: All servers, regardless of their platform, now have up-to-date firmware, reducing the risk of power-related failures.
-    750+ Man Hours Saved: Automation significantly cut down the time required for manual upgrades, allowing us to reallocate resources to other resiliency-enhancing projects.
-    1500+ TPAM Requests Reduced: The uniform approach drastically reduced the need for platform-specific management, simplifying operations and reducing administration time.
+    // Start capturing packets
+    pcap_loop(handle, 0, packet_handler, (u_char *)file);
 
-HOW: Jenkins Pipeline with RIBCL and Vault Integration
+    // Cleanup
+    fclose(file);
+    pcap_close(handle);
+    return 0;
+}
 
-To automate the upgrade process across our diverse server environment, we integrated RIBCL into a Jenkins pipeline with HashiCorp Vault for secure credential management. This pipeline was key to ensuring a resilient, uniform, and automated upgrade process.
+Explanation:
 
-Automation Process:
+1. pcap_open_live: Opens the ens32 interface for live capture.
 
-    Inventory Management: Jenkins dynamically fetched device inventory, ensuring all relevant servers were included in the upgrade process.
-    Secure Credentials: HashiCorp Vault managed iLO credentials securely, enabling automated access without compromising security.
-    RIBCL Execution: The pipeline triggered RIBCL commands to upgrade PSU firmware across all platforms, including Linux, Windows, and ESXi.
-    Real-Time Monitoring: Continuous monitoring and reporting provided visibility into the upgrade process, ensuring timely resolution of any issues.
 
-Outcome:
+2. pcap_compile/setfilter: Sets a filter to capture only SNMP data (UDP on port 162).
 
-    Uniform Resiliency: The integration ensured that all 1500+ servers were upgraded within two months, enhancing the resiliency of our entire infrastructure.
-    Time Savings: The automated approach saved over 700 hours of manual work, allowing our teams to focus on other high-priority tasks.
-    Operational Efficiency: The reduction of 1500+ TPAM requests highlighted the efficiency gains from automating the upgrade process across all platforms.
 
-Conclusion
+3. packet_handler: Writes each packet to a file and resets the file if its size exceeds 500 MB.
 
-The adoption of RIBCL and the implementation of a Jenkins pipeline for PSU firmware upgrades have significantly enhanced the resiliency of our infrastructure. By achieving a uniform approach to firmware management across 1500+ servers, we mitigated the risks associated with power supply faults, reduced operational overhead, and saved over 700 hours of manual work. This project is a testament to the power of automation in maintaining and enhancing service resiliency, ensuring that our infrastructure is prepared to meet the demands of modern IT environments.
+
+4. freopen: Resets the file once the size limit is reached.
+
+
+
+Compile with -lpcap to link the pcap library:
+
+gcc snmp_listener.c -o snmp_listener -lpcap
+
