@@ -1,18 +1,16 @@
-To convert BST (British Summer Time) to UTC in Jenkins using Groovy, you can account for the daylight saving time offset. Typically, BST is UTC+1, while GMT (Greenwich Mean Time) is UTC. During daylight saving time, the conversion has to be handled carefully.
-
-Here’s a function that handles both GMT and BST and returns the time in UTC:
+To create a Jenkins Groovy function that returns the UTC time from the local system time (whatever time zone the system is using), you can use Java's java.time package, which supports time zone conversions easily. Here’s a function that converts the local time to UTC:
 
 import java.time.*
 import java.time.format.DateTimeFormatter
 
-def getUtcTimeFromGmtOrBst() {
-    // Get the current time in the system's time zone (assumed to be BST/GMT)
-    ZonedDateTime now = ZonedDateTime.now(ZoneId.of("Europe/London"))
+def getUtcTimeFromLocal() {
+    // Get the current local time (system's default time zone)
+    ZonedDateTime localTime = ZonedDateTime.now()
 
     // Convert it to UTC
-    ZonedDateTime utcTime = now.withZoneSameInstant(ZoneId.of("UTC"))
+    ZonedDateTime utcTime = localTime.withZoneSameInstant(ZoneId.of("UTC"))
 
-    // Format the time
+    // Format the time to a readable format
     DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
     return utcTime.format(formatter)
 }
@@ -24,7 +22,7 @@ pipeline {
         stage('Get UTC Time') {
             steps {
                 script {
-                    def utcTime = getUtcTimeFromGmtOrBst()
+                    def utcTime = getUtcTimeFromLocal()
                     echo "Current UTC Time: ${utcTime}"
                 }
             }
@@ -34,12 +32,12 @@ pipeline {
 
 Explanation:
 
-ZoneId.of("Europe/London"): This handles both GMT and BST automatically, adjusting for daylight saving time when necessary.
+ZonedDateTime.now(): Gets the current local time based on the system's default time zone.
 
-withZoneSameInstant(ZoneId.of("UTC")): Converts the BST/GMT time to UTC.
+withZoneSameInstant(ZoneId.of("UTC")): Converts the local time to UTC.
 
-DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"): Formats the date and time for better readability.
+DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"): Formats the date and time to a readable string in the format yyyy-MM-dd HH:mm:ss.
 
 
-This Groovy function can be used within a Jenkins pipeline to get the current UTC time, adjusting for BST during daylight saving periods.
+This function can be easily integrated into a Jenkins pipeline to get the current UTC time based on the local system time.
 
