@@ -1,18 +1,43 @@
-To create a Jenkins Groovy function that returns the UTC time from the local system time (whatever time zone the system is using), you can use Java's java.time package, which supports time zone conversions easily. Here’s a function that converts the local time to UTC:
+In Jenkins, the error Scripts not permitted to use staticmethod java.time.ZonedDateTime now occurs because Jenkins’ Groovy Sandbox restricts certain Java methods for security reasons. You can either:
 
-import java.time.*
-import java.time.format.DateTimeFormatter
+1. Approve the method through the Jenkins script approval process (if you have admin rights).
+
+
+2. Use a workaround that is compatible with the Groovy Sandbox.
+
+
+
+Option 1: Approve the method (requires admin access)
+
+If you have admin rights, you can approve the method by following these steps:
+
+1. Run the pipeline once. It will fail and ask for script approval.
+
+
+2. Navigate to Manage Jenkins → In-process Script Approval.
+
+
+3. Approve the necessary signatures (in this case, staticMethod java.time.ZonedDateTime now).
+
+
+
+Option 2: Workaround for Jenkins Sandbox
+
+If you can't approve the script, you can use an alternative method that is sandbox-friendly, by working with more Groovy-based libraries like Date and TimeZone. Here’s a sandbox-friendly version using Date:
 
 def getUtcTimeFromLocal() {
-    // Get the current local time (system's default time zone)
-    ZonedDateTime localTime = ZonedDateTime.now()
+    // Get the current local time
+    def now = new Date()
 
-    // Convert it to UTC
-    ZonedDateTime utcTime = localTime.withZoneSameInstant(ZoneId.of("UTC"))
+    // Get the UTC timezone
+    TimeZone utcTimeZone = TimeZone.getTimeZone("UTC")
 
-    // Format the time to a readable format
-    DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
-    return utcTime.format(formatter)
+    // Create a formatter and set its time zone to UTC
+    def dateFormat = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+    dateFormat.setTimeZone(utcTimeZone)
+
+    // Return the formatted UTC time
+    return dateFormat.format(now)
 }
 
 // Example usage in Jenkins pipeline
@@ -32,12 +57,12 @@ pipeline {
 
 Explanation:
 
-ZonedDateTime.now(): Gets the current local time based on the system's default time zone.
+new Date(): Gets the current local time.
 
-withZoneSameInstant(ZoneId.of("UTC")): Converts the local time to UTC.
+TimeZone.getTimeZone("UTC"): Retrieves the UTC time zone.
 
-DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"): Formats the date and time to a readable string in the format yyyy-MM-dd HH:mm:ss.
+SimpleDateFormat: Formats the date and time string according to the pattern yyyy-MM-dd HH:mm:ss, and the time zone is set to UTC.
 
 
-This function can be easily integrated into a Jenkins pipeline to get the current UTC time based on the local system time.
+This method is compatible with the Jenkins Groovy sandbox and should work without requiring any additional script approval.
 
