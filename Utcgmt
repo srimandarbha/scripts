@@ -1,0 +1,45 @@
+To convert BST (British Summer Time) to UTC in Jenkins using Groovy, you can account for the daylight saving time offset. Typically, BST is UTC+1, while GMT (Greenwich Mean Time) is UTC. During daylight saving time, the conversion has to be handled carefully.
+
+Here’s a function that handles both GMT and BST and returns the time in UTC:
+
+import java.time.*
+import java.time.format.DateTimeFormatter
+
+def getUtcTimeFromGmtOrBst() {
+    // Get the current time in the system's time zone (assumed to be BST/GMT)
+    ZonedDateTime now = ZonedDateTime.now(ZoneId.of("Europe/London"))
+
+    // Convert it to UTC
+    ZonedDateTime utcTime = now.withZoneSameInstant(ZoneId.of("UTC"))
+
+    // Format the time
+    DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+    return utcTime.format(formatter)
+}
+
+// Example usage in Jenkins pipeline
+pipeline {
+    agent any
+    stages {
+        stage('Get UTC Time') {
+            steps {
+                script {
+                    def utcTime = getUtcTimeFromGmtOrBst()
+                    echo "Current UTC Time: ${utcTime}"
+                }
+            }
+        }
+    }
+}
+
+Explanation:
+
+ZoneId.of("Europe/London"): This handles both GMT and BST automatically, adjusting for daylight saving time when necessary.
+
+withZoneSameInstant(ZoneId.of("UTC")): Converts the BST/GMT time to UTC.
+
+DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"): Formats the date and time for better readability.
+
+
+This Groovy function can be used within a Jenkins pipeline to get the current UTC time, adjusting for BST during daylight saving periods.
+
