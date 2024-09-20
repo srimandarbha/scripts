@@ -1,0 +1,66 @@
+Introduction
+
+Good morning, and thank you for being here. I’m pleased to provide an update on our ongoing Site Reliability Engineering (SRE) initiative. Our goal is to enhance the reliability and performance of our services, and today I’ll take you through the progress we’ve made, the challenges we’ve faced, and the steps we’re taking to ensure success.
+
+Overview of the SRE Initiative
+
+As you know, we are overseeing 153 critical services across a range of technologies—APIs, Linux, Windows, antivirus, Hadoop, SCOM, Kong, and Mulesoft. Out of these, we’ve successfully defined Service Level Indicators (SLIs), Service Level Objectives (SLOs), and Error Budgets for approximately 43% of the services. These metrics are critical to understanding and managing the performance, availability, and reliability of our systems.
+
+Steps We're Following
+
+To give you a clear picture of our approach, here are the key steps we’re following for each service:
+
+    Communication & Data Gathering: The first step is to communicate with service owners and gather the necessary data. This includes identifying the critical metrics that define the health and performance of each service.
+
+    Identifying Server Metrics: Next, we are pinpointing the right metrics—availability, latency, throughput, and error rates—that will serve as SLIs.
+
+    Defining SLI/SLO/Error Budgets: Once we have those metrics, we define the SLIs and SLOs for the service, and allocate an appropriate error budget. This helps us balance innovation with reliability.
+
+    SRE Maturity Matrix: We’ve developed an SRE Maturity Matrix that ranks each service based on how well it aligns with SRE practices—whether it’s at an ad-hoc, beginner, intermediate, or expert level.
+
+    Onboarding to the SRE Dashboard: Finally, we’re onboarding services to the SRE dashboard to ensure that we have centralized visibility into key metrics and can monitor them in real time.
+
+Progress So Far
+
+As I mentioned earlier, we’ve made significant progress—43% of services now have clearly defined SLIs, SLOs, and error budgets. This is a strong foundation that helps us make data-driven decisions about service quality and incident management. We’ve also framed the SRE Capability Matrix, which we will roll out in the next stage to categorize and rank services based on their adherence to SRE best practices.
+
+Challenges Faced
+
+However, this initiative is not without its challenges. These are some of the key roadblocks we’re encountering:
+
+    Lack of Observability: For many services, there is still a gap in observability. Without proper monitoring tools in place, we struggle to collect the metrics required to define SLIs effectively.
+
+    Undefined SLIs: Some services don’t have SLIs defined yet, which makes it difficult to measure their performance or set realistic SLOs.
+
+    Error Budget Management: In a number of cases, error budgets are not being actively managed. This leads to an imbalance between development velocity and service reliability.
+
+    Capability Gaps in SRE Maturity: Finally, some services are not meeting all the capabilities outlined in the SRE Maturity Matrix. This means there is still a lot of manual intervention and reactive response for incidents, which can delay resolution times and impact service uptime.
+
+Next Steps
+
+Despite these challenges, we are making steady progress and have a clear roadmap for the future. Here’s what we’ll be focusing on in the next phase:
+
+    Enhanced Observability: We will prioritize improving observability for services that currently lack monitoring tools. This will help us gather the data we need to define meaningful SLIs and improve service reliability.
+
+    Completing SLI/SLO Definition: For services that are lagging, we’ll accelerate the process of defining SLIs and SLOs, ensuring we have clear targets to measure against.
+
+    Error Budget Management: We will work closely with teams to instill the importance of managing error budgets, ensuring that there is a balance between reliability and feature development.
+
+    Implementing the SRE Capability Matrix: In parallel, we’ll begin the implementation of the SRE Maturity Matrix. This matrix will be key to identifying where each service stands in terms of SRE practices and what actions are needed to elevate them to higher levels of maturity.
+
+    Onboarding Remaining Services: Finally, our goal is to onboard all services to the SRE dashboard, so that we have real-time, centralized monitoring of all key metrics, across the entire portfolio.
+
+Business Impact and Benefits
+
+The benefits of this initiative are wide-reaching. By the end of this process, we expect:
+
+    Improved Uptime: Proactive monitoring and SLO-driven management will help prevent incidents and reduce downtime.
+    Faster Incident Response: With real-time observability and the SRE dashboard in place, we’ll be able to respond to incidents faster and with greater accuracy.
+    Data-Driven Decisions: SLIs, SLOs, and error budgets will allow us to make decisions based on hard data, whether it’s about deploying a new feature or allocating resources for reliability improvements.
+    Operational Efficiency: Automating responses and maturing services will free up valuable engineering resources, enabling teams to focus on innovation.
+
+Call to Action
+
+Looking ahead, your continued support is crucial. The success of this initiative depends on the right resources, and active collaboration across teams. We are confident that, with your backing, we can overcome the challenges ahead and fully realize the benefits of a mature SRE framework across all our services.
+
+Thank you for your time, and I’m happy to take any questions.
