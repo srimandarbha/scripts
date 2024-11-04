@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SRE Flowchart</title>
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({startOnLoad:true});
+    </script>
+    <style>
+        .mermaid {
+            background-color: #f9f9f9;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            padding: 10px;
+            margin: 20px;
+            overflow: auto;
+        }
+    </style>
+</head>
+<body>
+    <div class="mermaid">
+    flowchart TB
+        %% Style definitions
+        classDef initial fill:#e6f3ff,stroke:#7ea6e0,stroke-width:2px
+        classDef process fill:#fff3e6,stroke:#d79b00,stroke-width:2px
+        classDef decision fill:#fff5e6,stroke:#d79b00,stroke-width:2px
+        classDef input fill:#e6ffe6,stroke:#82b366,stroke-width:2px
+        classDef metrics fill:#ffe6e6,stroke:#b85450,stroke-width:2px
+        classDef tools fill:#f0f8ff,stroke:#007acc,stroke-width:2px
+
+        %% 1. Initial Setup Section
+        subgraph INIT["1. Initial SRE Setup"]
+            A1["1. Identify Key Areas<br/>- Technical documentation<br/>- Observability<br/>- Capacity management<br/>- Toil reduction<br/>- Metrics collection"]
+            A2["2. Tool Selection<br/>- Python for scripting<br/>- OpenTelemetry for observability<br/>- React for UI/UX<br/>- Kafka for event-driven architecture<br/>- Power BI for dashboards"]
+            A3["3. Initial Documentation<br/>- Create baseline docs<br/>- Define architecture and design specs"]
+            A4["4. Observability Setup<br/>- Implement OpenTelemetry<br/>- Set up logging and monitoring"]
+            A5["5. Capacity Planning<br/>- Resource estimation<br/>- Define scaling strategies"]
+            A6["6. Toil Assessment<br/>- Identify manual processes<br/>- Establish automation candidates"]
+            A7["7. Define Metrics<br/>- Set SLOs and SLIs<br/>- Identify key performance indicators"]
+
+            A1 --> A2
+            A2 --> A3
+            A3 --> A4
+            A3 --> A5
+            A3 --> A6
+            A3 --> A7
+        end
+
+        %% Decision Point: Go/No-Go for Launch
+        A8["8. Go/No-Go for Launch?"]:::decision
+        A7 --> A8
+
+        %% 2. Continuous Improvement Cycle
+        subgraph IMP["2. Continuous Improvement Cycle"]
+            B1["9. Release Deployment<br/>- Deploy code changes<br/>- Verify release"]
+            B2["10. Post-Release Review<br/>- Analyze observability data<br/>- Review incident reports"]
+            B3["11. Performance Metrics Review<br/>- Assess against SLOs<br/>- Evaluate capacity usage"]
+            B4["12. Feedback Loop<br/>- Gather feedback from teams<br/>- Identify new areas for improvement"]
+            B5["13. Update Documentation<br/>- Revise runbooks<br/>- Document lessons learned"]
+            B6["14. Tools and Automation Review<br/>- Evaluate tool effectiveness<br/>- Identify further automation opportunities"]
+            B7["15. Continuous Monitoring<br/>- Use OpenTelemetry for ongoing observability<br/>- Create dashboards in Power BI"]
+            B8["16. Decision Point: New Improvements?"]:::decision
+
+            A8 -- Yes --> B1
+            A8 -- No --> A2
+            B1 --> B2 --> B3 --> B4 --> B5 --> B6 --> B7 --> B8
+            B8 -- Yes --> B4
+            B8 -- No --> B1
+        end
+
+        %% External Data Sources
+        subgraph INPUT["3. External Inputs"]
+            C1["17. User Feedback<br/>- Collect feature requests<br/>- Capture pain points"]
+            C2["18. Performance Metrics<br/>- Analyze system performance<br/>- Identify trends"]
+            C3["19. Incident Reports<br/>- Review root cause analyses<br/>- Define action items"]
+            C4["20. Usage Data<br/>- Monitor application usage<br/>- Assess capacity trends"]
+            C5["21. Automation Opportunities<br/>- Identify repetitive tasks<br/>- Suggest automation tools"]
+        end
+
+        %% Inter-section connections
+        INIT --> IMP
+        C1 --> B4
+        C2 --> B3
+        C3 --> B2
+        C4 --> B3
+        C5 --> B6
+
+        %% Apply styles
+        class INIT section
+        class IMP section
+        class INPUT section
+        
+        %% Apply individual node styles
+        class A1,A2,A3,A4,A5,A6,A7 initial
+        class B1,B2,B3,B4,B5,B6,B7,B8 process
+        class C1,C2,C3,C4,C5 input
+    </div>
+</body>
+</html>
