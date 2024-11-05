@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SRE Process Flowchart</title>
+    <script type="module">
+        import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+        mermaid.initialize({
+            theme: "default",
+            themeVariables: {
+                fontSize: "16px",
+                fontFamily: "arial"
+            }
+        });
+    </script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f5f5f5;
+        }
+        .mermaid {
+            max-width: 90%;
+            margin: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="mermaid">
+        %%{init: {'theme': 'default', 'themeVariables': { 'fontSize': '16px', 'fontFamily': 'arial' }}}%%
+        flowchart LR
+            subgraph Initial["1. Initial SRE Setup"]
+                A[IDP Platform\nLaunch]
+                -->|1. Architecture Docs,\n2. Design Specs| B[Establish Baseline\nDocumentation]
+                B -->|3. Monitoring Configs| C[Set Up Initial\nObservability]
+                B -->|4. Resource Estimates| D[Implement Basic\nCapacity Planning]
+                B -->|5. Manual Process\nInventory| E[Conduct Initial\nToil Assessment]
+                B -->|6. Define SLOs\nand KPIs| F[Establish Core\nSRE Metrics]
+            end
+            
+            subgraph Process["2. Continuous Release\nand Analysis Cycle"]
+                G[7. Perform\nRelease Deployment] 
+                -->|8. Deployment Logs| H[9. Conduct Post-Release\nData Analysis]
+                H -->|10. Performance Metrics| I[11. Review\nOperational Metrics]
+                I -->|12. Update Runbooks,\n13. Document Lessons| J[Enhance\nDocumentation]
+                J -->|14. Identify New\nMonitoring Needs| K[Improve\nObservability]
+                K -->|15. Analyze Resource\nUtilization Data| L[Optimize\nCapacity Planning]
+                L -->|16. Identify Process\nBottlenecks| M[Discover Toil Reduction\nOpportunities]
+                M -->|17. Refine SLIs\nand Error Budgets| N[Enhance\nSRE Metrics]
+                N -->|18. Define Improvement\nInitiatives| O[Plan SRE\nEnhancements]
+                O -->|19. Prioritize\nImprovement Items| P[Prioritize for\nNext Release]
+                P -->|20. Update Release\nArtifacts and Config| G
+            end
+            
+            subgraph Input["3. External Data Inputs"]
+                Q[21. Receive Developer\nFeedback] -->|22. Feature Requests,\nPain Points| P
+                R[23. Collect System\nPerformance Data] -->|24. Metrics and Trends| I
+                S[25. Review\nIncident Reports] -->|26. RCA and\nAction Items| H
+                T[27. Analyze\nUsage Patterns] -->|28. Capacity Trends\nand Forecasts| L
+                U[29. Identify\nAutomation Opportunities] -->|30. Automation\nCandidate Processes| M
+            end
+            
+            subgraph Metrics["4. SRE Metrics\nCollection and Analysis"]
+                V[31. Track SLIs\nand SLOs] -->|32. SLO\nCompliance Data| W[33. Manage\nError Budgets]
+                W -->|34. Reliability\nMetrics| X[35. Monitor\nMTTR and MTTF]
+                X -->|36. Operational\nPerformance Metrics| Y[37. Measure\nToil Percentage]
+                Y -->|38. Efficiency\nMetrics| Z[39. Analyze\nPlatform Adoption]
+                Z -->|40. Usage\nMetrics| V
+            end
+            
+            Initial --> Process
+            Metrics --> I
+            I --> Metrics
+            
+            style Initial fill:#e6f3ff
+            style Process fill:#fff3e6 
+            style Input fill:#e6ffe6
+            style Metrics fill:#ffe6e6
+    </div>
+</body>
+</html>
