@@ -1,0 +1,48 @@
+import json
+from faker import Faker
+from datetime import datetime, timezone
+import random
+
+# Initialize Faker
+fake = Faker()
+
+# Generate new log entry
+new_entry = {
+    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+    "service":  "log-sla-service",
+    "status": random.choice(["healthy", "degraded", "down"])
+}
+
+# Convert to compact JSON format (one-line JSON)
+compact_json = json.dumps(new_entry, separators=(",", ":"))
+
+# Append to file
+with open("app_sla.log", "a") as file:
+    file.write(compact_json + "\n")
+
+print(f"New log entry added: {compact_json}")
+
+
+###
+   filelog:
+    include: [ "app_sla.log" ]  # Update with the actual file path
+    start_at: beginning
+    operators:
+      - type: json_parser
+        id: parse_json
+        parse_from: body
+        timestamp:
+          parse_from: attributes.timestamp
+          layout: '%Y-%m-%dT%H:%M:%S.%fZ'  # Adjust format based on your timestamp
+          location: UTC
+      - type: move
+        from: attributes.timestamp
+        to: attributes.collector_timestamp
+
+  transform:
+    log_statements:
+      - context: log
+        statements:
+          - set(log.attributes["gateway_timestamp"], log.time)
+        conditions:
+          - attributes["service"] == "log-sla-service"
