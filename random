@@ -54,7 +54,7 @@ from(bucket: "your_bucket")
   |> filter(fn: (r) => r["_measurement"] == "your_measurement")
   |> map(fn: (r) => ({
       _time: r["_time"],  
-      collector_latency: duration(v: int(v: time(v: r["collector_timestamp"])) - int(v: time(v: r["_time"]))), 
-      gateway_latency: duration(v: int(v: time(v: r["gateway_timestamp"])) - int(v: time(v: r["collector_timestamp"]))), 
-      total_latency: duration(v: int(v: time(v: r["gateway_timestamp"])) - int(v: time(v: r["_time"])))
+      collector_latency: float(v: int(v: time(v: r["collector_timestamp"])) - int(v: time(v: r["_time"]))) / 1000000000.0, 
+      gateway_latency: float(v: int(v: time(v: r["gateway_timestamp"])) - int(v: time(v: r["collector_timestamp"]))) / 1000000000.0, 
+      total_latency: float(v: int(v: time(v: r["gateway_timestamp"])) - int(v: time(v: r["_time"]))) / 1000000000.0
   }))
