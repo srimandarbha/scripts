@@ -46,3 +46,15 @@ print(f"New log entry added: {compact_json}")
           - set(log.attributes["gateway_timestamp"], log.time)
         conditions:
           - attributes["service"] == "log-sla-service"
+
+
+###
+from(bucket: "your_bucket")
+  |> range(start: -1h)  // Adjust time range as needed
+  |> filter(fn: (r) => r["_measurement"] == "your_measurement")
+  |> map(fn: (r) => ({
+      _time: r["_time"],  
+      collector_latency: int(v: uint(v: time(v: r["collector_timestamp"])) / 1000000000) - int(v: uint(v: time(v: r["_time"])) / 1000000000), 
+      gateway_latency: int(v: uint(v: time(v: r["gateway_timestamp"])) / 1000000000) - int(v: uint(v: time(v: r["collector_timestamp"])) / 1000000000), 
+      total_latency: int(v: uint(v: time(v: r["gateway_timestamp"])) / 1000000000) - int(v: uint(v: time(v: r["_time"])) / 1000000000)
+  }))
