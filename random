@@ -104,3 +104,14 @@ from(bucket: "your_bucket")
 | delta = g_time - c_time
 | store_delta = s_time - g_time
 | line_format "Collector to Gateway Delay: {{ .delta }}s, Gateway to Storage Delay: {{ .store_delta }}s"
+
+##
+
+{service_name="unknown_service"} 
+| json collector_timestamp, gateway_timestamp
+| timestamp() as stored_time  # Loki ingestion time
+| duration(collector_timestamp) as c_time
+| duration(gateway_timestamp) as g_time
+| delta_cg = g_time - c_time  # Collector → Gateway delay
+| delta_gs = stored_time - g_time  # Gateway → Loki delay
+| line_format "Collector to Gateway: {{ .delta_cg }}s, Gateway to Loki: {{ .delta_gs }}s"
