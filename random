@@ -62,14 +62,13 @@ from(bucket: "your_bucket")
 
 ###
 {job="otel-gateway"} 
-| pattern `<collector_timestamp> <gateway_timestamp> <log_stored_timestamp>`
-| unwrap(collector_timestamp) as collector_ts
-| unwrap(gateway_timestamp) as gateway_ts
-| unwrap(log_stored_timestamp) as stored_ts
-| line_format "{{ .collector_ts }} {{ .gateway_ts }} {{ .stored_ts }}"
-| __time(collector_ts) as c_time
-| __time(gateway_ts) as g_time
-| __time(stored_ts) as s_time
+| json  
+| unwrap collector_timestamp as c_ts
+| unwrap gateway_timestamp as g_ts
+| unwrap log_stored_timestamp as s_ts
+| __time(c_ts) as c_time
+| __time(g_ts) as g_time
+| __time(s_ts) as s_time
 | delta = g_time - c_time
 | store_delta = s_time - g_time
 | line_format "Collector to Gateway Delay: {{ .delta }}s, Gateway to Storage Delay: {{ .store_delta }}s"
