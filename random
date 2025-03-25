@@ -72,3 +72,23 @@ from(bucket: "your_bucket")
 | delta = g_time - c_time
 | store_delta = s_time - g_time
 | line_format "Collector to Gateway Delay: {{ .delta }}s, Gateway to Storage Delay: {{ .store_delta }}s"
+
+###
+{job="otel-gateway"} 
+| regexp "(?P<c_ts>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z) (?P<g_ts>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z) (?P<s_ts>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z)"
+| duration(c_ts) as c_time
+| duration(g_ts) as g_time
+| duration(s_ts) as s_time
+| delta = g_time - c_time
+| store_delta = s_time - g_time
+| line_format "Collector to Gateway Delay: {{ .delta }}s, Gateway to Storage Delay: {{ .store_delta }}s"
+
+##£
+{job="otel-gateway"} 
+| json 
+| duration(collector_timestamp) as c_time
+| duration(gateway_timestamp) as g_time
+| duration(log_stored_timestamp) as s_time
+| delta = g_time - c_time
+| store_delta = s_time - g_time
+| line_format "Collector to Gateway Delay: {{ .delta }}s, Gateway to Storage Delay: {{ .store_delta }}s"
