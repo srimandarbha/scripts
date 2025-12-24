@@ -1,0 +1,180 @@
+vm-inventory-local/
+├── cmd/
+│   └── main.go                 # Entry point with Cache Selector
+├── internal/
+│   ├── controller/
+│   │   ├── inventory_controller.go  # Main sync logic (Cached)
+│   │   └── compliance_scanner.go    # Background metric scanner (Direct)
+│   └── metrics/
+│       └── metrics.go               # Custom Prometheus definitions
+├── Dockerfile                   # Multi-stage production build
+├── Makefile                     # Build and deployment automation
+└── go.mod                       # Dependencies
+
+
+_---------
+
+package controller
+
+import (
+    "context"
+    "database/sql"
+    "encoding/json"
+    kubevirtv1 "kubevirt.io/api/core/v1"
+    "sigs.k8s.io/controller-runtime/pkg/client"
+    "sigs.k8s.io/controller-runtime/pkg/reconcile"
+)
+
+type InventoryReconciler struct {
+    client.Client
+    DB          *sql.DB
+    ClusterName string
+}
+
+func (r *InventoryReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+    var vm kubevirtv1.VirtualMachine
+    if err := r.Get(ctx, req.NamespacedName, &vm); err != nil {
+        return reconcile.Result{}, client.IgnoreNotFound(err)
+    }
+
+    // Direct write to Central Postgres
+    annoData, _ := json.Marshal(vm.Annotations)
+    _, err := r.DB.Exec(`
+        INSERT INTO vm_inventory (cluster_name, vm_name, namespace, annotations, last_seen)
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (cluster_name, vm_name, namespace) 
+        DO UPDATE SET annotations = $4, last_seen = NOW()`, 
+        r.ClusterName, vm.Name, vm.Namespace, annoData)
+
+    return reconcile.Result{}, err
+}
+
+------
+
+package main
+
+import (
+    "os"
+    "sigs.k8s.io/controller-runtime/pkg/cache"
+    "k8s.io/apimachinery/pkg/labels"
+    "k8s.io/apimachinery/pkg/selection"
+    "vm-inventory-local/internal/controller"
+)
+
+func main() {
+    // 1. Label Filter: sre.org.io/inventorysync=true
+    req, _ := labels.NewRequirement("sre.org.io/inventorysync", selection.Equals, []string{"true"})
+    selector := labels.NewSelector().Add(*req)
+
+    mgr, _ := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+        Cache: cache.Options{
+            ByObject: map[client.Object]cache.ByObject{
+                &kubevirtv1.VirtualMachine{}: {Label: selector},
+            },
+        },
+    })
+
+    // 2. Initialize Reconciler
+    db, _ := sql.Open("postgres", os.Getenv("DATABASE_URL"))
+    (&controller.InventoryReconciler{
+        Client:      mgr.GetClient(),
+        DB:          db,
+        ClusterName: os.Getenv("CLUSTER_NAME"),
+    }).SetupWithManager(mgr)
+
+    // 3. Start Compliance Scanner (Direct Client)
+    go controller.StartComplianceScanner(ctrl.SetupSignalHandler(), mgr.GetAPIReader())
+
+    mgr.Start(ctrl.SetupSignalHandler())
+}
+
+----
+
+// internal/controller/metrics.go
+package controller
+
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
+)
+
+var (
+	// Gauge to track non-compliant VMs per namespace
+	nonSyncableVMs = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "inventory_sync_non_compliant_vms_total",
+			Help: "Number of VMs missing the sre.org.io/inventorysync=true label",
+		},
+		[]string{"namespace"},
+	)
+)
+
+func init() {
+	// Register custom metrics with the global prometheus registry
+	metrics.Registry.MustRegister(nonSyncableVMs)
+}
+
+----
+
+# Stage 1: Build
+FROM golang:1.21-alpine AS builder
+WORKDIR /workspace
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o manager cmd/main.go
+
+# Stage 2: Final Image
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /
+COPY --from=builder /workspace/manager .
+USER 65532:65532
+ENTRYPOINT ["/manager"]
+
+
+----
+IMG ?= myregistry.io/sre/inventory-operator:latest
+
+.PHONY: manifests
+manifests: ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+	controller-gen rbac:roleName=manager-role crd paths="./..." output:crd:artifacts:config=config/crd/bases
+
+.PHONY: docker-build
+docker-build: ## Build docker image with the manager.
+	docker build -t ${IMG} .
+
+.PHONY: deploy
+deploy: manifests ## Deploy controller to the K8s cluster.
+	cd config/manager && kustomize edit set image controller=${IMG}
+	kustomize build config/default | kubectl apply -f -
+
+
+------
+
+// internal/controller/scanner.go
+func StartComplianceScanner(ctx context.Context, c client.Client) {
+	ticker := time.NewTicker(10 * time.Minute)
+	for {
+		select {
+		case <-ticker.C:
+			var vmList kubevirtv1.VirtualMachineList
+			// Use a direct client to bypass the filtered cache
+			c.List(ctx, &vmList)
+			
+			counts := make(map[string]float64)
+			for _, vm := range vmList.Items {
+				if vm.Labels["sre.org.io/inventorysync"] != "true" {
+					counts[vm.Namespace]++
+				}
+			}
+			
+			// Update Prometheus
+			for ns, count := range counts {
+				nonSyncableVMs.WithLabelValues(ns).Set(count)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
