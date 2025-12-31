@@ -14,3 +14,5 @@ curl -k -b cookies.txt -X POST   https://localhost:5024/rest/tools/discover/addS
     "system.model": "Unknown",
     "system.serial": "UNKNOWN-SERIAL"
   }'
+
+curl -k -H "Authorization: Bearer PrimarySystem:4f520934600b94962b50688fc0e70860" -X OPTIONS https://localhost:5024/tools/discover/getlogs -i
