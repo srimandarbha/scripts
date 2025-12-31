@@ -1,0 +1,16 @@
+working steps
+ curl -k -c cookies.txt -X POST   https://localhost:5024/esa/j_security_check   -H "Content-Type: application/x-www-form-urlencoded"   -d "j_username=<username>&j_password=<password>"
+
+curl -k -b cookies.txt -X POST   https://localhost:5024/rest/tools/discover/addSystemToDB   -H "Content-Type: application/json"   -H "Accept: application/json"   -d '{
+    "type": "Dell iDRAC8",
+    "endpointname": "node1",
+    "ipaddress": "10.2.21.23",
+    "username": "esaclient",
+    "password": "esaclient",
+    "protocol": "SNMP",
+    "system.os.name": "Unknown",
+    "system.host.name": "node1",
+    "system.ibm.machine.type": "Generic",
+    "system.model": "Unknown",
+    "system.serial": "UNKNOWN-SERIAL"
+  }'
