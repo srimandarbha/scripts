@@ -1,0 +1,29 @@
+[22/02, 23:09] Sriman Darbha: (.auto) PS C:\Users\SRIMANDARBHA> cat .\connection-test.json
+{
+    "version": "1.0.0",
+    "title": "Do we have connectivity?",
+    "description": "Check if we can see nodes in the cluster",
+    "steady-state-hypothesis": {
+        "title": "Verifying Kubernetes Connection",
+        "probes": [
+            {
+                "type": "probe",
+                "name": "can-list-nodes",
+                "tolerance": true,
+                "provider": {
+                    "type": "python",
+                    "module": "chaosk8s.node.probes",
+                    "func": "nodes_must_be_healthy"
+                }
+            }
+        ]
+    },
+    "method": []
+}
+(.auto) PS C:\Users\SRIMANDARBHA> python3 -c "import chaosk8s.node.probes; print(dir(chaosk8s.node.probes))"
+[22/02, 23:19] Sriman Darbha: python3 -c "import chaosk8s.node; import pkgutil; print([name for _, name, _ in pkgutil.iter_modules(chaosk8s.node.__path__)])"
+['actions', 'probes']
+[22/02, 23:20] Sriman Darbha: python3 -c "import chaosk8s.node.actions; print([f for f in dir(chaosk8s.node.actions) if not f.startswith('_')])"
+['ActivityFailed', 'Any', 'ApiException', 'Dict', 'List', 'Secrets', 'client', 'cordon_node', 'create_k8s_api_client', 'create_node', 'delete_nodes', 'drain_nodes', 'logger', 'logging', 'random', 'time', 'uncordon_node']
+[22/02, 23:21] Sriman Darbha: python3 -c "import chaosk8s; import pkgutil; print([name for _, name, _ in pkgutil.iter_modules(chaosk8s.__path__)])"
+['actions', 'chaosmesh', 'crd', 'daemonset', 'deployment', 'event', 'namespace', 'networking', 'node', 'pod', 'probes', 'replicaset', 'secret', 'service', 'statefulset']
