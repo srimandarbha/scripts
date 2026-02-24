@@ -1,0 +1,68 @@
+Category,Subcategory,Fault_Name,Description,Severity,Impact
+Compute,Node,Abrupt_Worker_Shutdown,Hard power off a worker node hosting VMs,Critical,SLA_Risk
+Compute,Node,Graceful_Node_Drain,Drain worker node under active VM load,High,Medium
+Compute,Node,Node_Cordon_Under_Load,Cordon node during heavy scheduling,Medium,Medium
+Compute,Resource,CPU_Saturation,Stress CPU to 90-100 percent on worker,High,High
+Compute,Resource,Memory_Pressure,Induce memory pressure to trigger eviction thresholds,High,High
+Compute,Resource,Disk_Pressure,Fill node root disk to trigger disk pressure,High,High
+Compute,Service,Kubelet_Restart,Restart kubelet on worker node,High,Medium
+Compute,Service,CRI-O_Restart,Restart container runtime on worker,High,Medium
+Compute,Virtualization,Kill_Virt_Launcher_Pod,Delete virt-launcher pod of running VM,High,Medium
+Compute,Virtualization,Kill_QEMU_Process,Terminate QEMU process inside virt-launcher,Critical,SLA_Risk
+Compute,Virtualization,Block_Live_Migration,Interrupt migration mid-transfer,High,High
+Compute,Virtualization,Throttle_Destination_CPU,Limit CPU on migration target node,Medium,Medium
+
+Storage,CSI,Restart_CSI_Controller,Restart CSI controller pods,Medium,Low
+Storage,CSI,Restart_CSI_Node_Plugin,Restart CSI node daemonset,High,Medium
+Storage,CSI,Block_CSI_API,Temporarily block CSI API communication,High,High
+Storage,PVC,PVC_Detach_Reattach_Under_Load,Force volume detach and reattach while VM active,Critical,SLA_Risk
+Storage,Path,Disable_Multipath_Route,Disable one storage path,High,Medium
+Storage,Path,Path_Flapping,Simulate intermittent storage path failure,Critical,High
+Storage,Performance,Inject_IO_Latency,Introduce artificial storage latency,Critical,SLA_Risk
+Storage,Performance,Throttle_IOPS,Limit storage IOPS throughput,High,High
+Storage,Backend,Temporary_Backend_Unavailable,Simulate backend storage outage,Critical,SLA_Risk
+Storage,Capacity,Near_Capacity_Exhaustion,Fill storage pool close to maximum capacity,High,High
+
+Network,Overlay,Packet_Loss_Between_Nodes,Inject packet loss across workers,High,High
+Network,Overlay,Inject_Cross_Zone_Latency,Add 50-200ms latency between zones,Critical,High
+Network,Overlay,Drop_Node_Traffic,Block network traffic between selected nodes,Critical,SLA_Risk
+Network,Overlay,Restart_OVN_Controller,Restart OVN controller components,Medium,Medium
+Network,Underlay,Rack_Isolation,Simulate rack level network isolation,Critical,SLA_Risk
+Network,Underlay,MTU_Mismatch,Create MTU mismatch scenario,High,High
+Network,Service,DNS_Unavailability,Block DNS resolution temporarily,Medium,Medium
+
+ControlPlane,API,Restart_API_Server,Restart one API server pod,Medium,Low
+ControlPlane,API,Inject_API_Latency,Add latency to API server responses,High,Medium
+ControlPlane,API,API_Rate_Limiting,Simulate API throttling,High,Medium
+ControlPlane,Scheduler,Restart_Scheduler,Restart kube-scheduler pod,Medium,Low
+ControlPlane,Scheduler,Scheduling_Queue_Pressure,Increase artificial scheduling backlog,High,Medium
+ControlPlane,etcd,Restart_etcd_Member,Restart one etcd member,High,Medium
+ControlPlane,etcd,etcd_Network_Isolation,Simulate network isolation of etcd node,Critical,High
+ControlPlane,etcd,etcd_Disk_Latency,Inject disk latency on etcd node,Critical,High
+
+Virtualization,KubeVirt,Disable_Live_Migration,Temporarily disable migration feature,High,High
+Virtualization,KubeVirt,Block_Migration_Network,Interrupt migration network path,Critical,SLA_Risk
+Virtualization,KubeVirt,Migration_Bandwidth_Cap,Reduce allowed migration bandwidth,Medium,Medium
+Virtualization,KubeVirt,Kill_Virt_Controller,Restart virt-controller pod,Medium,Low
+Virtualization,KubeVirt,Kill_Virt_API,Restart virt-api pod,Medium,Low
+Virtualization,KubeVirt,Stuck_Migration_Simulation,Force migration to hang,Critical,SLA_Risk
+Virtualization,KubeVirt,Exceed_Migration_Concurrency,Trigger high number of simultaneous migrations,Critical,SLA_Risk
+Virtualization,VM_Config,CPU_Pinning_Failover,Fail node hosting CPU pinned VM,High,High
+Virtualization,VM_Config,HugePages_Failover,Fail node hosting hugepages based VM,High,High
+
+Topology,Zone,Full_Zone_Cordon,Cordon all nodes in one zone,Critical,SLA_Risk
+Topology,Zone,Multiple_Node_Failure_Same_Zone,Power off multiple nodes in same zone,Critical,SLA_Risk
+Topology,Zone,Cross_Zone_Latency_Spike,Inject high latency between zones,Critical,High
+Topology,Distribution,Uneven_VM_Distribution_Then_Fail,Skew VM placement then fail zone,Critical,SLA_Risk
+Topology,Storage,Zone_Specific_Storage_Path_Disable,Disable storage access from one zone,Critical,SLA_Risk
+
+Capacity,Cluster,High_CPU_Cluster_Load,Run cluster at 80-90 percent CPU,High,High
+Capacity,Cluster,High_Memory_Utilization,Increase cluster memory usage close to limit,High,High
+Capacity,Cluster,High_Background_IO,Generate heavy storage IO load,Critical,High
+Capacity,Cluster,High_Pod_Churn,Create and delete pods rapidly,Medium,Medium
+Capacity,Cluster,Log_Volume_Explosion,Generate excessive logging traffic,Medium,Medium
+
+Lifecycle,Upgrade,Upgrade_Under_VM_Load,Upgrade cluster while VMs active,Critical,SLA_Risk
+Lifecycle,Upgrade,Sequential_Node_Reboots,Reboot workers sequentially during load,High,Medium
+Lifecycle,Upgrade,Failed_Upgrade_Rollback,Simulate upgrade rollback,Critical,SLA_Risk
+Lifecycle,Maintenance,Migration_During_Node_OS_Update,Test VM migration during OS patching,High,Medium
