@@ -1,0 +1,238 @@
+This collection of Chaos Toolkit (CTK) experiment templates covers the critical platform infrastructure for a disconnected OpenShift Virtualization environment. Each JSON file includes the logic discussed above embedded as metadata and documentation.
+1. Mirror Registry Connectivity Loss
+This experiment tests the platform's resilience when the local image source is severed.
+{
+    "version": "1.0.0",
+    "title": "Platform Resilience: Local Mirror Registry Connectivity Loss",
+    "description": "In a disconnected environment, the local registry is the single source of truth. This experiment validates that the platform (OLM, CVO) handles registry timeouts gracefully without crashing existing services.",
+    "tags": ["platform", "disconnected", "registry"],
+    "steady-state-hypothesis": {
+        "title": "Cluster Operators remain Available",
+        "probes": [
+            {
+                "type": "probe",
+                "name": "check-cluster-operators-status",
+                "tolerance": true,
+                "provider": {
+                    "type": "python",
+                    "module": "chaosk8s.cluster.probes",
+                    "func": "all_cluster_operators_are_available"
+                }
+            }
+        ]
+    },
+    "method": [
+        {
+            "name": "block-registry-access",
+            "type": "action",
+            "provider": {
+                "type": "python",
+                "module": "chaosk8s.actions",
+                "func": "create_network_policy",
+                "arguments": {
+                    "spec": {
+                        "podSelector": {},
+                        "policyTypes": ["Egress"],
+                        "egress": [{
+                            "to": [{
+                                "ipBlock": {
+                                    "cidr": "0.0.0.0/0",
+                                    "except": ["<REGISTRY_IP>/32"]
+                                }
+                            }]
+                        }]
+                    }
+                }
+            },
+            "pauses": { "after": 30 }
+        }
+    ],
+    "rollbacks": [
+        {
+            "type": "action",
+            "name": "remove-registry-block",
+            "provider": {
+                "type": "python",
+                "module": "chaosk8s.actions",
+                "func": "delete_network_policy"
+            }
+        }
+    ]
+}
+
+2. Etcd Disk Latency (IO Stress)
+Critical for Bare Metal OpenShift where local storage performance directly impacts API availability.
+{
+    "version": "1.0.0",
+    "title": "Platform Infrastructure: Etcd Disk IO Stress",
+    "description": "Disconnected environments often use on-prem storage. Etcd must maintain latency < 10ms. This experiment injects IO stress on master nodes to verify API stability.",
+    "tags": ["etcd", "infrastructure", "storage"],
+    "steady-state-hypothesis": {
+        "title": "API Server Response Time",
+        "probes": [
+            {
+                "type": "probe",
+                "name": "api-is-responsive",
+                "tolerance": 200,
+                "provider": {
+                    "type": "http",
+                    "url": "https://api.cluster.local:6443/readyz",
+                    "timeout": 0.5
+                }
+            }
+        ]
+    },
+    "method": [
+        {
+            "name": "inject-disk-stress-on-etcd",
+            "type": "action",
+            "provider": {
+                "type": "process",
+                "path": "stress-ng",
+                "arguments": "--io 4 --temp-path /var/lib/etcd --timeout 60s"
+            }
+        }
+    ]
+}
+
+3. Operator Lifecycle Manager (OLM) Stability
+Ensures that the "manager of managers" can recover from pod failure in the openshift-operator-lifecycle-manager namespace.
+{
+    "version": "1.0.0",
+    "title": "Control Plane: OLM Component Failure",
+    "description": "Validates that the platform's ability to manage the Virtualization stack recovers within 30s after a component crash.",
+    "tags": ["olm", "control-plane"],
+    "steady-state-hypothesis": {
+        "title": "OLM is Functional",
+        "probes": [
+            {
+                "type": "probe",
+                "name": "olm-operator-running",
+                "tolerance": true,
+                "provider": {
+                    "type": "python",
+                    "module": "chaosk8s.pod.probes",
+                    "func": "pods_in_phase",
+                    "arguments": {
+                        "label_selector": "app=olm-operator",
+                        "namespace": "openshift-operator-lifecycle-manager",
+                        "phase": "Running"
+                    }
+                }
+            }
+        ]
+    },
+    "method": [
+        {
+            "name": "terminate-olm-pod",
+            "type": "action",
+            "provider": {
+                "type": "python",
+                "module": "chaosk8s.pod.actions",
+                "func": "terminate_pods",
+                "arguments": {
+                    "label_selector": "app=olm-operator",
+                    "namespace": "openshift-operator-lifecycle-manager",
+                    "rand": true
+                }
+            }
+        }
+    ]
+}
+
+4. Node Level: Kubelet Process Hang
+Simulates a kernel-level hang or process freeze on a worker node hosting the Virtualization stack.
+{
+    "version": "1.0.0",
+    "title": "Node Infrastructure: Kubelet Process Hang",
+    "description": "Sends SIGSTOP to Kubelet. The Machine Config Operator (MCO) should eventually detect the node as NotReady and trigger fencing/maintenance.",
+    "tags": ["node", "kubelet", "baremetal"],
+    "steady-state-hypothesis": {
+        "title": "Node Health Check",
+        "probes": [
+            {
+                "type": "probe",
+                "name": "node-remains-ready",
+                "tolerance": true,
+                "provider": {
+                    "type": "python",
+                    "module": "chaosk8s.node.probes",
+                    "func": "node_is_ready",
+                    "arguments": { "name": "worker-0" }
+                }
+            }
+        ]
+    },
+    "method": [
+        {
+            "name": "freeze-kubelet",
+            "type": "action",
+            "provider": {
+                "type": "process",
+                "path": "ssh",
+                "arguments": ["core@worker-0", "sudo kill -STOP $(pgrep kubelet)"]
+            }
+        }
+    ],
+    "rollbacks": [
+        {
+            "type": "action",
+            "name": "resume-kubelet",
+            "provider": {
+                "type": "process",
+                "path": "ssh",
+                "arguments": ["core@worker-0", "sudo kill -CONT $(pgrep kubelet)"]
+            }
+        }
+    ]
+}
+
+Next Step: Would you like me to provide the specific Kubeconfig and ServiceAccount setup required to run these experiments against a restricted OpenShift namespace?
+
+
+
+_----------
+
+To focus strictly on the OpenShift Platform (Infrastructure) level for a disconnected environment, the chaos experiments must target the "plumbing" that keeps the cluster operational without an external internet connection.
+In a disconnected setup, your primary risks are the Local Mirror Registry, Operator Lifecycle Manager (OLM), ImageContentSourcePolicies (ICSP), and the API/Etcd stability under resource pressure.
+1. Mirror Registry & Image Resolution Faults
+In disconnected environments, all images (including the OpenShift Virtualization operator images) are pulled from a local registry. If this link breaks, the platform cannot scale or recover from node failures.
+ * Experiment: Mirror Registry Network Partition
+   * Fault: Block traffic from worker nodes to the internal/local mirror registry.
+   * Hypothesis: Existing running pods remain stable, but any platform-level reconciliation (like an Operator update or a node restart) will fail. The cluster should report ImagePullBackOff for new infrastructure pods but not crash existing ones.
+   * Chaos Toolkit Implementation: Use chaosk8s.actions.network_partition to block the Registry Service IP.
+ * Experiment: ICSP/IDMS Corruption
+   * Fault: Delete or misconfigure the ImageContentSourcePolicy (ICSP) or ImageDigestMirrorSet (IDMS) that maps registry.redhat.io to your local mirror.
+   * Hypothesis: The Cluster Version Operator (CVO) and OLM should immediately alert (Degraded state), as they can no longer resolve platform image manifests.
+   * Chaos Toolkit Implementation: Use chaosk8s.actions.delete_custom_resource for the ICSP object.
+2. Control Plane & Operator Resilience
+These experiments target the "brains" of the platform that manage the Virtualization stack.
+ * Experiment: Operator Lifecycle Manager (OLM) Pod Kill
+   * Fault: Terminate the catalog-operator or olm-operator pods in the openshift-operator-lifecycle-manager namespace.
+   * Hypothesis: OLM is a deployment; the pods should be recreated by the replicaset. The platform's ability to manage the virt-operator should recover within 30 seconds.
+   * Chaos Toolkit Implementation: Use chaosk8s.actions.terminate_pods with label app=catalog-operator.
+ * Experiment: Etcd Quorum Stress (Disconnected Disk)
+   * Fault: Inject high I/O wait or disk pressure on the nodes hosting the Etcd database.
+   * Hypothesis: Since disconnected environments often use on-prem storage (ODF/LSO), Etcd must maintain a latency below 10ms. If latency spikes, the API becomes unresponsive.
+   * Chaos Toolkit Implementation: Use a stress-ng action on the master nodes to target the /var/lib/etcd mount point.
+3. Node-Level Infrastructure Faults
+Since OpenShift Virtualization often runs on Bare Metal in disconnected sites, hardware-level failures are critical.
+ * Experiment: Kubelet Process Hang
+   * Fault: Send a SIGSTOP to the Kubelet process on a worker node.
+   * Hypothesis: The OpenShift Machine Config Operator (MCO) should eventually detect the node as NotReady. The platform must trigger a "Node Maintenance" or "Fence" event to protect the workloads.
+   * Chaos Toolkit Implementation: Use chaoshsh.actions.run_command to execute kill -STOP <kubelet_pid> via SSH.
+ * Experiment: Time Sync (NTP) Drift
+   * Fault: Intentionally drift the system clock on a master node in the disconnected network.
+   * Hypothesis: OpenShift is extremely sensitive to time sync. If the drift exceeds a threshold, Etcd certificates may become "invalid" (future/past dated), causing the platform to lock up.
+   * Chaos Toolkit Implementation: Use chaoshsh.actions.run_command to adjust the chronyd or system time.
+Summary Table for Chaos Toolkit
+| Platform Component | Chaos Fault | Steady State Hypothesis |
+|---|---|---|
+| Mirror Registry | Network Latency/Loss | oc get co shows all operators "Available" and not "Degraded". |
+| CVO / OLM | Pod Termination | olm-operator pods return to Running state within T < 60s. |
+| API Server | Memory Hog | API response time for GET /nodes remains < 500ms. |
+| Etcd | Disk IO Stress | Etcd leader changes remain stable; no "request timed out" errors. |
+| Network (Multus) | CNI Pod Delete | Secondary network definitions (NetworkAttachmentDefinitions) remain valid. |
+Next Step
+Would you like me to generate a complete Chaos Toolkit JSON experiment file for one of these specific platform scenarios (e.g., the Mirror Registry failure)?
+
