@@ -236,3 +236,46 @@ Summary Table for Chaos Toolkit
 Next Step
 Would you like me to generate a complete Chaos Toolkit JSON experiment file for one of these specific platform scenarios (e.g., the Mirror Registry failure)?
 
+[06/03, 12:46] Sriman Darbha: The Workflow
+Observe: Look at your steady state (the baseline).
+Hypothesize: Predict that the steady state will continue despite the fault.
+Experiment: Introduce the variable (e.g., kill a process, unplug a disk).
+Analyze: Compare the results against your hypothesis to find the weakness.
+[06/03, 12:47] Sriman Darbha: User / Alert
+      ↓
+PlannerAgent
+      ↓
+RetrieverAgent (pgvector RAG)
+      ↓
+DiagnoserAgent
+      ↓
+RiskAssessmentAgent
+      ↓
+RemediatorAgent
+      ↓
+ExecutorTool (kubectl / oc / API)
+      ↓
+ValidatorAgent
+      ↓
+Feedback Loop
+[06/03, 12:47] Sriman Darbha: Prometheus Alert
+        ↓
+Webhook Trigger
+        ↓
+Planner Agent
+        ↓
+Retriever (pgvector)
+        ↓
+Diagnoser
+        ↓
+Risk Guard
+        ↓
+Remediator
+        ↓
+Executor (RBAC scoped)
+        ↓
+Validator
+        ↓
+Rollback if needed
+        ↓
+Metrics + Audit Log
