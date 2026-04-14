@@ -1,0 +1,81 @@
+flowchart TD
+    subgraph Cluster Data Sources
+        OCP[OCP Clusters x30+]
+        AM[AlertManager]
+        ACM[ACM Hub]
+    end
+
+    subgraph Observability
+        OA[Observability Agent]
+        SPLUNK[(Splunk)]
+        OA -- Backed by --> SPLUNK
+    end
+
+    subgraph External Sources
+        SNOW[SNOW cron poll]
+        RHOKT[RHOKT P Docs weekly]
+        HV[HashiVault]
+        AAP_EXT[AAP]
+        EDA[EDA App + MongoDB]
+    end
+
+    subgraph SRE Agent VM
+        KB[Kafka Bridge]
+        SP[Stream Processor]
+        KCT[Kafka Consolidated Topic]
+
+        SA[Supervisor Agent]
+
+        QA[Query Agent]
+        RCA[RCA Agent]
+        RA[Remediation Agent]
+        GAA[Gap Analysis Agent]
+        FR[Freeze Registry]
+        EA[Execution Agent]
+        VA[Validation Agent]
+
+        subgraph Shared Data Layer
+            PG[(PostgreSQL 15 + pgvector)]
+            PGC[(pg_cache UNLOGGED)]
+            PB[PgBouncer]
+            RAG[RAG API FastAPI]
+            OLLAMA[Ollama fallback]
+        end
+
+        UI[Streamlit SRE UI]
+    end
+
+    subgraph In-House AI Platform
+        LLM[Phi-4 / Qwen3 / Mistral]
+        NOMIC[nomic-embed-text]
+    end
+
+    %% Cluster flow
+    OCP --> AM
+    AM -- Raw Topic --> KB
+    QA -. fetches live facts .-> ACM
+
+    %% VM Internal Flow
+    KB --> SP
+    SP --> KCT
+    KCT --> SA
+
+    SA --> QA
+    SA --> RCA
+    SA --> RA
+    SA --> GAA
+    SA --> FR
+    SA --> EA
+    SA --> VA
+
+    %% AI Platform Flow
+    RAG -. API calls .-> LLM
+    RAG -. API calls .-> NOMIC
+
+    %% External & Execution Flow
+    EA -. triggers .-> AAP_EXT
+    EA -. checks .-> FR
+    AAP_EXT -- Kafka Results Topic --> PG
+
+    %% Observability Monitoring
+    OA -. monitors logs/metrics .-> SRE Agent VM
