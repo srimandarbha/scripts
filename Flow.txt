@@ -1,17 +1,17 @@
 flowchart TD
-    subgraph Cluster Data Sources
+    subgraph Cluster_Data_Sources [Cluster Data Sources]
         OCP[OCP Clusters x30+]
         AM[AlertManager]
         ACM[ACM Hub]
     end
 
-    subgraph Observability
+    subgraph Observability [Observability]
         OA[Observability Agent]
         SPLUNK[(Splunk)]
         OA -- Backed by --> SPLUNK
     end
 
-    subgraph External Sources
+    subgraph External_Sources [External Sources]
         SNOW[SNOW cron poll]
         RHOKT[RHOKT P Docs weekly]
         HV[HashiVault]
@@ -19,7 +19,7 @@ flowchart TD
         EDA[EDA App + MongoDB]
     end
 
-    subgraph SRE Agent VM
+    subgraph SRE_VM [SRE Agent VM]
         KB[Kafka Bridge]
         SP[Stream Processor]
         KCT[Kafka Consolidated Topic]
@@ -34,7 +34,7 @@ flowchart TD
         EA[Execution Agent]
         VA[Validation Agent]
 
-        subgraph Shared Data Layer
+        subgraph Shared_Data_Layer [Shared Data Layer]
             PG[(PostgreSQL 15 + pgvector)]
             PGC[(pg_cache UNLOGGED)]
             PB[PgBouncer]
@@ -45,7 +45,7 @@ flowchart TD
         UI[Streamlit SRE UI]
     end
 
-    subgraph In-House AI Platform
+    subgraph AI_Platform [In-House AI Platform]
         LLM[Phi-4 / Qwen3 / Mistral]
         NOMIC[nomic-embed-text]
     end
@@ -78,4 +78,4 @@ flowchart TD
     AAP_EXT -- Kafka Results Topic --> PG
 
     %% Observability Monitoring
-    OA -. monitors logs/metrics .-> SRE Agent VM
+    OA -. monitors logs/metrics .-> SRE_VM
