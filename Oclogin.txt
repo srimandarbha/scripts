@@ -1,0 +1,16 @@
+# Add this to your ~/.bashrc or ~/.zshrc
+oc-prod() {
+    CLUSTER_URL="https://api.prod-cluster.example.com:6443"
+    CONTEXT_NAME="prod-cluster-context" # Find this via 'oc config get-contexts'
+
+    # 1. Check if we are already logged in to this cluster
+    # 'oc whoami' returns an error code if the session is expired or invalid
+    if oc whoami --request-timeout=2s > /dev/null 2>&1; then
+        echo "✅ Session active. Switching context..."
+        oc config use-context "$CONTEXT_NAME"
+    else
+        echo "❌ Session expired or not logged in. Please authenticate:"
+        # 2. Trigger login (this will interactively ask for your password)
+        oc login "$CLUSTER_URL" -u your-username
+    fi
+}
