@@ -1,5 +1,6 @@
 #!/bin/bash
-# rbac-check.sh - Human-readable RBAC audit for OpenShift Virtualization groups
+# rbac-audit.sh - RBAC Human-Readable Audit + Anomaly Detection
+# Covers: support-engineering, migration-operations, platform-sre, vm-read-operator
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 NAMESPACE="${NAMESPACE:-default}"
@@ -7,10 +8,11 @@ GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
-# ─── GROUP → DISPLAY NAME MAPPING ─────────────────────────────────────────────
+# ─── GROUP DISPLAY NAMES ──────────────────────────────────────────────────────
 declare -A GROUP_LABELS=(
   ["support-engineering"]="Support Engineer"
   ["migration-operations"]="Migration Operations"
@@ -18,59 +20,69 @@ declare -A GROUP_LABELS=(
   ["vm-read-operator"]="VM Read Operator"
 )
 
-# ─── PERMISSION MATRIX ────────────────────────────────────────────────────────
-# Format: "display_message|verb|resource|subresource(optional)"
+# ─── EXPECTED PERMISSION CHECKS ───────────────────────────────────────────────
+# Format: "display_message|verb|resource|subresource"
 declare -A GROUP_CHECKS
 
 GROUP_CHECKS["support-engineering"]="
 view pods|get|pods|
+list pods|list|pods|
 read pod logs|get|pods|log
 list deployments|list|deployments|
 view services|get|services|
 view configmaps|get|configmaps|
+view events|get|events|
 view virtual machines|get|virtualmachines|
+list virtual machines|list|virtualmachines|
+view VM instances|get|virtualmachineinstances|
 read VM console logs|get|virtualmachineinstances|log
+view persistent volume claims|get|persistentvolumeclaims|
+view datavolumes|get|datavolumes|
 list namespaces|list|namespaces|
-delete pods|delete|pods|
-exec into pods|create|pods|exec
-create virtual machines|create|virtualmachines|
-delete virtual machines|delete|virtualmachines|
 "
 
 GROUP_CHECKS["migration-operations"]="
 view pods|get|pods|
+list pods|list|pods|
 list virtual machines|list|virtualmachines|
 view VM instances|get|virtualmachineinstances|
+list VM instances|list|virtualmachineinstances|
 create VM migrations|create|virtualmachineinstancemigrations|
 list VM migrations|list|virtualmachineinstancemigrations|
 delete VM migrations|delete|virtualmachineinstancemigrations|
 view datavolumes|get|datavolumes|
 create datavolumes|create|datavolumes|
 view persistent volume claims|get|persistentvolumeclaims|
-delete virtual machines|delete|virtualmachines|
-modify configmaps|update|configmaps|
+create persistent volume claims|create|persistentvolumeclaims|
+view storage classes|get|storageclasses|
 view node resources|get|nodes|
+list nodes|list|nodes|
+view events|get|events|
 "
 
 GROUP_CHECKS["platform-sre"]="
 view pods|get|pods|
+list pods|list|pods|
 delete pods|delete|pods|
 exec into pods|create|pods|exec
 view pod logs|get|pods|log
 view configmaps|get|configmaps|
-modify configmaps|update|configmaps|
-view secrets|get|secrets|
+update configmaps|update|configmaps|
 list namespaces|list|namespaces|
 view nodes|get|nodes|
-cordon/uncordon nodes|patch|nodes|
+patch nodes (cordon/uncordon)|patch|nodes|
 list virtual machines|list|virtualmachines|
-start/stop virtual machines|update|virtualmachines|
+start and stop virtual machines|update|virtualmachines|
 create VM migrations|create|virtualmachineinstancemigrations|
 delete VM migrations|delete|virtualmachineinstancemigrations|
+view datavolumes|get|datavolumes|
 manage datavolumes|create|datavolumes|
 view persistent volumes|get|persistentvolumes|
+view persistent volume claims|get|persistentvolumeclaims|
 view cluster events|get|events|
-manage rolebindings|create|rolebindings|
+view secrets|get|secrets|
+view storage classes|get|storageclasses|
+manage rolebindings in namespace|create|rolebindings|
 "
 
 GROUP_CHECKS["vm-read-operator"]="
@@ -79,21 +91,126 @@ list virtual machines|list|virtualmachines|
 view VM instances|get|virtualmachineinstances|
 list VM instances|list|virtualmachineinstances|
 view VM migrations|get|virtualmachineinstancemigrations|
+list VM migrations|list|virtualmachineinstancemigrations|
 view datavolumes|get|datavolumes|
+list datavolumes|list|datavolumes|
 view persistent volume claims|get|persistentvolumeclaims|
 view pods|get|pods|
 read pod logs|get|pods|log
 list services|list|services|
 view configmaps|get|configmaps|
-delete virtual machines|delete|virtualmachines|
-create virtual machines|create|virtualmachines|
-modify datavolumes|update|datavolumes|
-exec into pods|create|pods|exec
-delete pods|delete|pods|
+view events|get|events|
 "
 
-# ─── FUNCTIONS ────────────────────────────────────────────────────────────────
+# ─── ANOMALY CHECKS ───────────────────────────────────────────────────────────
+# These are privileges each group should NEVER have.
+# Format: "human_description|verb|resource|subresource|severity(HIGH/MEDIUM/LOW)"
+declare -A ANOMALY_CHECKS
 
+ANOMALY_CHECKS["support-engineering"]="
+create or delete namespaces|create|namespaces||HIGH
+delete namespaces|delete|namespaces||HIGH
+manage ClusterRoles|create|clusterroles||HIGH
+manage ClusterRoleBindings|create|clusterrolebindings||HIGH
+manage RoleBindings|create|rolebindings||HIGH
+add managed clusters (ACM)|create|managedclusters||HIGH
+delete managed clusters|delete|managedclusters||HIGH
+create ClusterDeployments (Hive)|create|clusterdeployments||HIGH
+exec into pods|create|pods|exec|MEDIUM
+delete pods|delete|pods||MEDIUM
+read secrets|get|secrets||HIGH
+list all secrets|list|secrets||HIGH
+manage nodes|patch|nodes||HIGH
+delete nodes|delete|nodes||HIGH
+create deployments|create|deployments||MEDIUM
+delete deployments|delete|deployments||MEDIUM
+manage network policies|create|networkpolicies||MEDIUM
+manage persistent volumes|create|persistentvolumes||MEDIUM
+delete persistent volumes|delete|persistentvolumes||MEDIUM
+manage storage classes|create|storageclasses||MEDIUM
+modify cluster version|patch|clusterversions||HIGH
+manage cluster operators|patch|clusteroperators||HIGH
+manage OAuth config|create|oauths||HIGH
+create virtual machines|create|virtualmachines||MEDIUM
+delete virtual machines|delete|virtualmachines||MEDIUM
+"
+
+ANOMALY_CHECKS["migration-operations"]="
+add managed clusters (ACM)|create|managedclusters||HIGH
+delete managed clusters|delete|managedclusters||HIGH
+create ClusterDeployments (Hive)|create|clusterdeployments||HIGH
+delete ClusterDeployments|delete|clusterdeployments||HIGH
+manage ClusterRoles|create|clusterroles||HIGH
+manage ClusterRoleBindings|create|clusterrolebindings||HIGH
+manage RoleBindings|create|rolebindings||HIGH
+create namespaces|create|namespaces||HIGH
+delete namespaces|delete|namespaces||HIGH
+read secrets broadly|get|secrets||HIGH
+list all secrets|list|secrets||HIGH
+exec into pods|create|pods|exec|MEDIUM
+delete pods|delete|pods||LOW
+cordon or delete nodes|patch|nodes||HIGH
+delete nodes|delete|nodes||HIGH
+manage network policies|create|networkpolicies||MEDIUM
+manage storage classes|create|storageclasses||MEDIUM
+delete storage classes|delete|storageclasses||MEDIUM
+modify cluster version|patch|clusterversions||HIGH
+manage cluster operators|patch|clusteroperators||HIGH
+manage OAuth config|create|oauths||HIGH
+manage deployments|create|deployments||MEDIUM
+delete deployments|delete|deployments||MEDIUM
+"
+
+ANOMALY_CHECKS["platform-sre"]="
+add managed clusters (ACM)|create|managedclusters||HIGH
+delete managed clusters|delete|managedclusters||HIGH
+create ClusterDeployments (Hive)|create|clusterdeployments||HIGH
+manage ClusterRoles globally|create|clusterroles||HIGH
+manage ClusterRoleBindings globally|create|clusterrolebindings||HIGH
+modify cluster version (upgrade cluster)|patch|clusterversions||HIGH
+disable cluster operators|delete|clusteroperators||HIGH
+manage OAuth configuration|create|oauths||HIGH
+manage OAuth configuration|update|oauths||HIGH
+delete namespaces|delete|namespaces||HIGH
+delete persistent volumes|delete|persistentvolumes||MEDIUM
+delete storage classes|delete|storageclasses||MEDIUM
+delete nodes|delete|nodes||HIGH
+list all secrets across cluster|list|secrets||MEDIUM
+manage admission webhooks|create|validatingwebhookconfigurations||HIGH
+manage admission webhooks|create|mutatingwebhookconfigurations||HIGH
+"
+
+ANOMALY_CHECKS["vm-read-operator"]="
+create virtual machines|create|virtualmachines||HIGH
+update virtual machines|update|virtualmachines||HIGH
+delete virtual machines|delete|virtualmachines||HIGH
+create VM migrations|create|virtualmachineinstancemigrations||HIGH
+delete VM migrations|delete|virtualmachineinstancemigrations||HIGH
+create datavolumes|create|datavolumes||HIGH
+update datavolumes|update|datavolumes||HIGH
+delete datavolumes|delete|datavolumes||HIGH
+exec into pods|create|pods|exec|HIGH
+delete pods|delete|pods||HIGH
+create pods|create|pods||HIGH
+read secrets|get|secrets||HIGH
+list secrets|list|secrets||HIGH
+manage RBAC roles|create|clusterroles||HIGH
+manage RBAC bindings|create|clusterrolebindings||HIGH
+manage rolebindings|create|rolebindings||HIGH
+add managed clusters (ACM)|create|managedclusters||HIGH
+create namespaces|create|namespaces||HIGH
+delete namespaces|delete|namespaces||HIGH
+patch or cordon nodes|patch|nodes||HIGH
+manage network policies|create|networkpolicies||MEDIUM
+manage configmaps|create|configmaps||LOW
+update configmaps|update|configmaps||LOW
+delete configmaps|delete|configmaps||MEDIUM
+manage persistent volumes|create|persistentvolumes||HIGH
+modify cluster version|patch|clusterversions||HIGH
+manage OAuth config|create|oauths||HIGH
+"
+
+# ─── CORE CHECK FUNCTION ──────────────────────────────────────────────────────
 check_permission() {
   local group="$1"
   local verb="$2"
@@ -101,40 +218,48 @@ check_permission() {
   local subresource="$4"
 
   if [[ -n "$subresource" ]]; then
-    result=$(oc auth can-i "$verb" "$resource/$subresource" \
-      --as-group="$group" --as="audit-user" -n "$NAMESPACE" 2>/dev/null)
+    oc auth can-i "$verb" "$resource/$subresource" \
+      --as-group="$group" --as="audit-user" -n "$NAMESPACE" 2>/dev/null
   else
-    result=$(oc auth can-i "$verb" "$resource" \
-      --as-group="$group" --as="audit-user" -n "$NAMESPACE" 2>/dev/null)
+    oc auth can-i "$verb" "$resource" \
+      --as-group="$group" --as="audit-user" -n "$NAMESPACE" 2>/dev/null
   fi
-
-  echo "$result"
 }
 
+# ─── SEVERITY BADGE ──────────────────────────────────────────────────────────
+severity_badge() {
+  case "$1" in
+    HIGH)   echo -e "${RED}[HIGH]${RESET}" ;;
+    MEDIUM) echo -e "${YELLOW}[MEDIUM]${RESET}" ;;
+    LOW)    echo -e "${CYAN}[LOW]${RESET}" ;;
+    *)      echo -e "${YELLOW}[UNKNOWN]${RESET}" ;;
+  esac
+}
+
+# ─── PRINT SECTION HEADER ─────────────────────────────────────────────────────
 print_group_header() {
   local label="$1"
+  local group="$2"
   echo ""
-  echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════╗${RESET}"
-  echo -e "${CYAN}${BOLD}   As a ${label}${RESET}"
-  echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════╝${RESET}"
+  echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════╗${RESET}"
+  printf "${CYAN}${BOLD}  %-56s  ${RESET}\n" "  👤 As a ${label} (${group})"
+  echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
   echo -e "  ${YELLOW}Namespace: ${NAMESPACE}${RESET}"
-  echo ""
 }
 
-run_checks_for_group() {
+# ─── EXPECTED PERMISSIONS SECTION ────────────────────────────────────────────
+run_expected_checks() {
   local group="$1"
-  local label="${GROUP_LABELS[$group]}"
   local checks="${GROUP_CHECKS[$group]}"
-  local pass=0
-  local fail=0
+  local pass=0 fail=0
 
-  print_group_header "$label"
+  echo ""
+  echo -e "  ${BOLD}── Expected Capabilities ──────────────────────────────────${RESET}"
+  echo ""
 
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-
     IFS='|' read -r display_msg verb resource subresource <<< "$line"
-
     display_msg=$(echo "$display_msg" | xargs)
     verb=$(echo "$verb" | xargs)
     resource=$(echo "$resource" | xargs)
@@ -149,49 +274,191 @@ run_checks_for_group() {
       echo -e "  ${RED}✘${RESET}  As per role, I ${RED}cannot${RESET} ${display_msg}"
       ((fail++))
     fi
-
   done <<< "$checks"
 
   echo ""
-  echo -e "  ${BOLD}Summary:${RESET} ${GREEN}${pass} allowed${RESET} | ${RED}${fail} denied${RESET}"
+  echo -e "  ${BOLD}Result:${RESET} ${GREEN}${pass} granted${RESET} | ${RED}${fail} missing${RESET}"
+
+  # Return counts via globals for summary
+  EXPECTED_PASS=$pass
+  EXPECTED_FAIL=$fail
+}
+
+# ─── ANOMALY DETECTION SECTION ───────────────────────────────────────────────
+run_anomaly_checks() {
+  local group="$1"
+  local checks="${ANOMALY_CHECKS[$group]}"
+  local anomaly_count=0
+  local clean_count=0
+  local anomaly_lines=()
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    IFS='|' read -r display_msg verb resource subresource severity <<< "$line"
+    display_msg=$(echo "$display_msg" | xargs)
+    verb=$(echo "$verb" | xargs)
+    resource=$(echo "$resource" | xargs)
+    subresource=$(echo "$subresource" | xargs)
+    severity=$(echo "$severity" | xargs)
+
+    result=$(check_permission "$group" "$verb" "$resource" "$subresource")
+
+    if [[ "$result" == "yes" ]]; then
+      badge=$(severity_badge "$severity")
+      anomaly_lines+=("  ${MAGENTA}⚠${RESET}  ${badge} I can ${BOLD}${display_msg}${RESET} — ${YELLOW}this is outside expected role scope${RESET}")
+      ((anomaly_count++))
+    else
+      ((clean_count++))
+    fi
+  done <<< "$checks"
+
+  echo ""
+  echo -e "  ${BOLD}── Privilege Anomaly Report ────────────────────────────────${RESET}"
+  echo ""
+
+  if [[ ${#anomaly_lines[@]} -eq 0 ]]; then
+    echo -e "  ${GREEN}✔  No unexpected privileges detected. Role scope looks clean.${RESET}"
+  else
+    for entry in "${anomaly_lines[@]}"; do
+      echo -e "$entry"
+    done
+  fi
+
+  echo ""
+  echo -e "  ${BOLD}Result:${RESET} ${MAGENTA}${anomaly_count} anomalies found${RESET} | ${GREEN}${clean_count} checks clean${RESET}"
+
+  ANOMALY_COUNT=$anomaly_count
+}
+
+# ─── GROUP SUMMARY ────────────────────────────────────────────────────────────
+print_group_footer() {
+  local label="$1"
+  local exp_pass=$2
+  local exp_fail=$3
+  local anomalies=$4
+
+  echo ""
+  echo -e "  ${BOLD}═══ ${label} Overall Summary ═══${RESET}"
+  echo -e "  ${GREEN}✔  Expected granted  : ${exp_pass}${RESET}"
+  echo -e "  ${RED}✘  Expected missing  : ${exp_fail}${RESET}"
+  echo -e "  ${MAGENTA}⚠  Anomalies found   : ${anomalies}${RESET}"
+
+  if [[ $anomalies -gt 0 ]]; then
+    echo -e "  ${YELLOW}→  Review ArgoCD ClusterRole/RoleBinding for this group!${RESET}"
+  fi
   echo ""
 }
 
-print_banner() {
-  echo -e "${BOLD}"
-  echo "  ╔═══════════════════════════════════════════════════╗"
-  echo "  ║     OpenShift RBAC Human-Readable Audit Tool      ║"
-  echo "  ╚═══════════════════════════════════════════════════╝"
-  echo -e "${RESET}"
-  echo -e "  ${YELLOW}Cluster:${RESET}    $(oc whoami --show-server 2>/dev/null)"
-  echo -e "  ${YELLOW}Namespace:${RESET}  ${NAMESPACE}"
-  echo -e "  ${YELLOW}Date:${RESET}       $(date '+%Y-%m-%d %H:%M:%S')"
+# ─── FINAL AUDIT SUMMARY ──────────────────────────────────────────────────────
+declare -A SUMMARY_PASS
+declare -A SUMMARY_FAIL
+declare -A SUMMARY_ANOMALY
+
+print_final_summary() {
+  echo ""
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}              CLUSTER-WIDE RBAC AUDIT SUMMARY              ${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════╝${RESET}"
+  echo ""
+  printf "  ${BOLD}%-30s %10s %10s %12s${RESET}\n" "Group" "Granted" "Missing" "Anomalies"
+  echo "  ──────────────────────────────────────────────────────────"
+
+  local total_anomalies=0
+  for group in "${!GROUP_LABELS[@]}"; do
+    local label="${GROUP_LABELS[$group]}"
+    local p="${SUMMARY_PASS[$group]:-0}"
+    local f="${SUMMARY_FAIL[$group]:-0}"
+    local a="${SUMMARY_ANOMALY[$group]:-0}"
+    ((total_anomalies += a))
+
+    local anomaly_display="${a}"
+    if [[ $a -gt 0 ]]; then
+      anomaly_display="${MAGENTA}${a} ⚠${RESET}"
+    else
+      anomaly_display="${GREEN}${a} ✔${RESET}"
+    fi
+
+    printf "  %-30s ${GREEN}%10s${RESET} ${RED}%10s${RESET} " "$label" "$p" "$f"
+    echo -e "$anomaly_display"
+  done
+
+  echo ""
+  if [[ $total_anomalies -gt 0 ]]; then
+    echo -e "  ${RED}${BOLD}⚠  ACTION REQUIRED: ${total_anomalies} anomalous privilege(s) detected across groups.${RESET}"
+    echo -e "  ${YELLOW}   Review your ArgoCD RBAC manifests and check ClusterRole aggregation rules.${RESET}"
+  else
+    echo -e "  ${GREEN}${BOLD}✔  All groups are within expected privilege boundaries.${RESET}"
+  fi
+  echo ""
 }
 
-# ─── OPTIONAL: OUTPUT TO FILE ─────────────────────────────────────────────────
+# ─── BANNER ───────────────────────────────────────────────────────────────────
+print_banner() {
+  echo -e "${BOLD}"
+  echo "  ╔══════════════════════════════════════════════════════════╗"
+  echo "  ║    OpenShift RBAC Audit + Privilege Anomaly Detector     ║"
+  echo "  ╚══════════════════════════════════════════════════════════╝"
+  echo -e "${RESET}"
+  echo -e "  ${YELLOW}Cluster  :${RESET}  $(oc whoami --show-server 2>/dev/null)"
+  echo -e "  ${YELLOW}Namespace:${RESET}  ${NAMESPACE}"
+  echo -e "  ${YELLOW}Date     :${RESET}  $(date '+%Y-%m-%d %H:%M:%S')"
+  echo ""
+  echo -e "  ${CYAN}Sections per group:${RESET}"
+  echo -e "  ${GREEN}✔${RESET} Expected Capabilities  — what this role should be able to do"
+  echo -e "  ${MAGENTA}⚠${RESET} Privilege Anomalies    — what this role should NEVER do"
+  echo ""
+}
+
+# ─── SAVE REPORT ──────────────────────────────────────────────────────────────
 save_report() {
   local outfile="rbac-audit-$(date +%Y%m%d-%H%M%S).txt"
-  "$0" | sed 's/\x1b\[[0-9;]*m//g' > "$outfile"
-  echo "Report saved to: $outfile"
+  # Re-run self, strip ANSI codes, save
+  NAMESPACE="$NAMESPACE" bash "$0" --all 2>/dev/null \
+    | sed 's/\x1b\[[0-9;]*m//g' > "$outfile"
+  echo -e "  ${GREEN}Report saved to: ${outfile}${RESET}"
+}
+
+# ─── RUN FOR ONE GROUP ────────────────────────────────────────────────────────
+run_group() {
+  local group="$1"
+  local label="${GROUP_LABELS[$group]}"
+
+  print_group_header "$label" "$group"
+  run_expected_checks "$group"
+  run_anomaly_checks "$group"
+  print_group_footer "$label" "$EXPECTED_PASS" "$EXPECTED_FAIL" "$ANOMALY_COUNT"
+
+  SUMMARY_PASS[$group]=$EXPECTED_PASS
+  SUMMARY_FAIL[$group]=$EXPECTED_FAIL
+  SUMMARY_ANOMALY[$group]=$ANOMALY_COUNT
 }
 
 # ─── USAGE ────────────────────────────────────────────────────────────────────
 usage() {
+  echo ""
   echo "Usage:"
-  echo "  ./rbac-check.sh                          # Check all groups"
-  echo "  ./rbac-check.sh --group platform-sre     # Check specific group"
-  echo "  NAMESPACE=my-ns ./rbac-check.sh          # Check in specific namespace"
-  echo "  ./rbac-check.sh --save                   # Save output to file"
+  echo "  ./rbac-audit.sh                           # Audit all groups"
+  echo "  ./rbac-audit.sh --group platform-sre      # Audit one group"
+  echo "  NAMESPACE=my-ns ./rbac-audit.sh           # Specify namespace"
+  echo "  ./rbac-audit.sh --save                    # Save output to file"
+  echo ""
+  echo "Available groups:"
+  for g in "${!GROUP_LABELS[@]}"; do
+    echo "  $g  →  ${GROUP_LABELS[$g]}"
+  done
+  echo ""
 }
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 main() {
   local target_group=""
+  local do_save=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --group) target_group="$2"; shift 2 ;;
-      --save)  save_report; exit 0 ;;
+      --save)  do_save=true; shift ;;
+      --all)   shift ;;  # internal flag used by --save
       --help)  usage; exit 0 ;;
       *) echo "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -199,17 +466,23 @@ main() {
 
   print_banner
 
+  if [[ "$do_save" == true ]]; then
+    save_report
+    exit 0
+  fi
+
   if [[ -n "$target_group" ]]; then
     if [[ -z "${GROUP_LABELS[$target_group]}" ]]; then
       echo "Unknown group: $target_group"
       echo "Available: ${!GROUP_LABELS[*]}"
       exit 1
     fi
-    run_checks_for_group "$target_group"
+    run_group "$target_group"
   else
-    for group in "${!GROUP_CHECKS[@]}"; do
-      run_checks_for_group "$group"
+    for group in "support-engineering" "migration-operations" "platform-sre" "vm-read-operator"; do
+      run_group "$group"
     done
+    print_final_summary
   fi
 }
 
