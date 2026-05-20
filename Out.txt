@@ -1,0 +1,24 @@
+{
+  "sender": "QueryAgent-v2",
+  "recipient": "IncidentActionAgent",
+  "payload_type": "ENRICHED_ALERT_DATA",
+  "content": {
+    "alertname": "HighCPUUtilization",
+    "cluster": "prod-cluster-01",
+    "namespace": "payment-services",
+    "correlation_id": "550e8400-e29b-41d4-a716-446655440000",
+    "hostname": "worker-node-a2",
+    "startAt": "2026-05-12T13:50:00Z",
+    "repeatingalert": "yes",
+    "existingAlertsperWeek": {
+      "INC0019283": {
+        "status": "closed",
+        "resolution": "positive"
+      },
+      "INC0019284": {
+        "status": "open",
+        "resolution": "negative"
+      }
+    }
+  }
+}
