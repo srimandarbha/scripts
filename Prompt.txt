@@ -1,0 +1,192 @@
+I am building an operational intelligence and recurrence analysis platform using ServiceNow incident/ticket APIs, Alertmanager alerts, Red Hat support case metadata, and AI agents for tool calling and RAG.
+
+My requirements are STRICT and production-oriented.
+
+Please design the COMPLETE architecture, schema strategy, ingestion pipeline, retention model, indexing strategy, recurrence logic, deduplication logic, vector search integration, and agent query model.
+
+The system requirements are:
+
+1. Data Source
+
+- ServiceNow API provides JSON responses.
+- Records include:
+  - sys_id
+  - number
+  - state
+  - sys_created_on
+  - sys_updated_on
+  - cluster information
+  - alert metadata
+  - Red Hat case information
+  - resolution details
+- Polling happens hourly.
+- API supports incremental filtering using sys_updated_on.
+
+2. Core Requirements
+
+- STRICTLY avoid duplicate records.
+- Store normalized structured data, not only raw JSON.
+- Preserve enough historical state for recurrence analytics.
+- Support detecting:
+  - recurring alerts
+  - reopened incidents
+  - temporary vs permanent resolutions
+  - repeated noisy alerts
+  - Red Hat case linkage
+  - historical remediation effectiveness
+- Support AI agent tool calling with low-latency queries.
+- Support future RAG/vector search on operational knowledge.
+
+3. Retention Requirements
+
+- Raw ingestion data should have short retention (example: 7 days).
+- Operational recurrence intelligence should persist longer.
+- Historical snapshots should support lifecycle analytics.
+- Design the retention strategy correctly and critique bad approaches if necessary.
+
+4. Database Requirements
+
+- Recommend the BEST database for:
+  - relational operational data
+  - vector search
+  - JSON support
+  - indexing
+  - deduplication
+  - AI/RAG integration
+- Critique alternatives like MongoDB, Elasticsearch, Pinecone, Cassandra, etc.
+- Explain WHY the selected database is best.
+
+5. Deduplication Requirements
+
+- Explain:
+  - what constitutes a duplicate
+  - why alertname-only deduplication is wrong
+  - how to deduplicate safely
+- Show:
+  - fingerprinting strategy
+  - unique constraints
+  - UPSERT strategy
+  - snapshot uniqueness model
+
+6. Schema Design Requirements
+   Provide COMPLETE schemas for:
+
+- current ticket state
+- historical ticket snapshots
+- recurrence intelligence
+- embeddings/vector storage
+- Red Hat case linkage
+- alert occurrence tracking
+
+For each schema:
+
+- explain purpose
+- explain indexes
+- explain constraints
+- explain update behavior
+- explain retention behavior
+
+7. JSON Normalization Requirements
+
+- Show sample ServiceNow JSON.
+- Show how fields are extracted and normalized.
+- Show which fields should remain in JSONB/raw form.
+- Explain why full dynamic flattening is a bad idea.
+
+8. Ingestion Pipeline Requirements
+   Design the full pipeline:
+
+- incremental polling
+- parsing
+- validation
+- deduplication
+- UPSERT logic
+- history append
+- recurrence aggregation
+- embedding generation
+- retention cleanup
+
+Include example pseudocode and SQL.
+
+9. Agent Tool Calling Requirements
+   The final architecture must support AI agents that can answer:
+
+- has this alert occurred before?
+- how many times?
+- was it reopened?
+- was the previous resolution temporary?
+- is there an associated Red Hat case?
+- what remediation was historically successful?
+- is this cluster noisy?
+- is this issue recurring after closure?
+
+Show example:
+
+- tool input
+- SQL queries
+- tool response JSON
+
+10. Vector Search / RAG Requirements
+    Design:
+
+- pgvector or equivalent vector architecture
+- embedding table
+- chunking strategy
+- metadata filters
+- operational knowledge embeddings
+- retrieval flow
+
+Explain:
+
+- what SHOULD be embedded
+- what should NOT be embedded
+- why raw JSON embedding is poor design
+
+11. Operational Requirements
+    The design should be:
+
+- scalable
+- production-grade
+- optimized for AI agents
+- optimized for recurrence analytics
+- optimized for low-latency lookups
+- operationally maintainable
+
+12. Critique Requirements
+    Do NOT sugar coat.
+    Critique:
+
+- naive designs
+- MMDD table strategies
+- raw JSON-only storage
+- over-normalization
+- under-normalization
+- deleting all data after 1 week
+- weak deduplication strategies
+- poor vector database choices
+
+13. Output Requirements
+    Provide:
+
+- architecture diagrams in text
+- schema DDL
+- sample table contents
+- ingestion examples
+- indexing strategy
+- retention strategy
+- example queries
+- example embeddings
+- recommended technology stack
+- tradeoff analysis
+- future scaling considerations
+
+The response should prioritize:
+
+- correctness
+- operational realism
+- long-term maintainability
+- AI-agent friendliness
+- recurrence intelligence quality
+
+Do not provide generic cloud-architecture fluff.
+Be assertive, practical, and technically critical.
