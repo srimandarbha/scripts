@@ -1,0 +1,456 @@
+================================================================================
+OPENSHIFT VIRTUALIZATION + KUBERNETES STACK — ALERT & PLAYBOOK CATALOG
+Full coverage: CNV/KubeVirt, CDI, OpenShift Core, Networking, HashiCorp Vault,
+               Portworx, Dell CSM, Storage (Ceph/ODF)
+================================================================================
+
+LEGEND
+  [B] = Built-in alert (already shipped with operator/platform)
+  [C] = Custom PromQL rule you need to write
+  [E] = Event-stream signal (K8s Events → Splunk, not Prometheus)
+
+================================================================================
+SECTION 1 — CDI (Containerized Data Importer)
+================================================================================
+
+CDI-01 [C] Import hung despite API=Running
+  Signal : rate(bytes transferred by importer pod) flat for >5 min while
+           DataVolume phase=ImportInProgress; use deriv() on network bytes
+           for the importer pod namespace
+  Playbook: Restart importer pod; verify source URL reachability; inspect
+            scratch PVC usage; escalate to storage if NFS/S3 unreachable
+
+CDI-02 [C] DataVolume stuck in Pending
+  Signal : kube_persistentvolumeclaim_status_phase{phase="Pending"} for
+           CDI-owned PVCs > 10 minutes
+  Playbook: Check StorageClass provisioner pod health; verify SC exists and
+            is default; check node disk pressure
+
+CDI-03 [B] Importer pod CrashLoopBackOff
+  Signal : kube_pod_container_status_restarts_total{pod=~"importer-.*"} > 3
+           in 10m  (built-in: CDIDataVolumeUnusualRestartCount)
+  Playbook: Pull importer logs; validate registry credentials; check scratch
+            PVC space; verify proxy/NetworkPolicy config
+
+CDI-04 [C] Import duration exceeds SLA
+  Signal : Custom: track DV creation timestamp vs rolling p95 historical
+           duration; deriv(bytes_transferred) below expected rate
+  Playbook: Notify requester; check node disk I/O contention; check source
+            bandwidth
+
+CDI-05 [C] Scratch PVC space exhausted
+  Signal : kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes
+           {namespace="cdi"} > 0.9
+  Playbook: Auto-expand scratch PVC if SC supports it; clean orphaned scratch
+            PVCs; alert storage admin
+
+CDI-06 [B] CDI operator degraded
+  Signal : csv_succeeded{name=~"cdi-operator.*"}==0 or
+           cluster_operator_conditions{condition="Degraded"}==1
+           (built-in: CDIOperatorDown)
+  Playbook: Check cdi-operator pod logs; reconcile CRs; check OLM subscription
+
+CDI-07 [E] Registry/HTTP source unreachable
+  Signal : K8s Event reason=ImportFailed with connection-refused pattern
+           via Splunk event pipeline
+  Playbook: Validate source URL; check NetworkPolicy; verify pull secret;
+            test proxy config
+
+================================================================================
+SECTION 2 — KubeVirt / virt-launcher
+================================================================================
+
+KV-01 [B] VM stuck in Starting phase
+  Signal : kubevirt_vmi_phase_count{phase="Pending"} duration > 10m
+           (built-in: KubeVirtVMStuck)
+  Playbook: Check node resource availability; verify device plugin VF
+            allocation; check image pull; inspect virt-launcher logs
+
+KV-02 [C] Live migration hung
+  Signal : deriv(kubevirt_vmi_migration_data_remaining_bytes[5m]) >= 0
+           while migration phase=Migrating; also check
+           kubevirt_vmi_migration_phase_transition_time_seconds vs baseline
+  Playbook: Abort via virtctl; check target node resources; verify
+            live-migration network bandwidth; review bandwidthPerMigration
+
+KV-03 [B] Migration repeated failures
+  Signal : increase(kubevirt_vmi_migration_failed_total[1h]) > 3
+           (built-in: KubeVirtVMIExcessiveMigrations)
+  Playbook: Check live-migration network (Multus/SR-IOV); check target node
+            resources; temporarily disable migration; review evictionStrategy
+
+KV-04 [B] VMI unexpected crash/restart
+  Signal : kubevirt_vmi_phase_count{phase="Failed"} increase; also
+           kube_pod_container_status_last_terminated_reason for virt-launcher
+  Playbook: Pull guest serial console logs; check host node health; inspect
+            qemu crash dump; notify VM owner
+
+KV-05 [C] virt-launcher OOMKilled
+  Signal : kube_pod_container_status_last_terminated_reason="OOMKilled"
+           for virt-launcher pods
+  Playbook: Adjust VM memory requests/limits; review cluster overcommit ratio;
+            migrate VM to larger node
+
+KV-06 [C] High guest memory swap-in
+  Signal : rate(kubevirt_vmi_memory_swap_in_traffic_bytes_total[5m])
+           above established baseline
+  Playbook: Alert VM owner to resize; check node memory pressure; tune
+            balloon driver
+
+KV-07 [C] Guest agent not responding
+  Signal : kubevirt_vmi_info{guest_os_info} absent or
+           last_api_connection_timestamp_seconds stale > 5m
+  Playbook: Attempt virtctl guestosinfo; SSH into VM; reinstall qemu-guest-agent;
+            escalate to VM owner
+
+KV-08 [C] Live migration network saturated
+  Signal : node_network_transmit_bytes_total on migration NIC near wire rate;
+           compare to kubevirt migration bandwidth limit config
+  Playbook: Throttle other workloads on node; reduce bandwidthPerMigration;
+            schedule migration off-peak
+
+KV-09 [C] vCPU steal time high
+  Signal : rate(kubevirt_vmi_vcpu_seconds{state="steal"}[5m]) > threshold
+  Playbook: Cordon node; redistribute VMs; review CPU overcommit ratio
+
+KV-10 [E] VM disk hotplug failure
+  Signal : K8s Event reason=HotplugVolumeMount failure via Splunk;
+           also CSI attacher error events
+  Playbook: Check CSI node plugin on target node; retry hotplug; verify
+            PVC RWO/RWX mode compatibility
+
+================================================================================
+SECTION 3 — KubeVirt Control Plane
+================================================================================
+
+KCP-01 [C] virt-controller leader election flapping
+  Signal : leader_election_master_status changes rapidly; virt-controller
+           restart count exceeds threshold
+  Playbook: Check etcd health and latency; inspect control-plane node
+            resources; check API server connectivity
+
+KCP-02 [B] virt-api unavailable
+  Signal : up{job="virt-api"}==0
+           (built-in: VirtAPIDown / KubeVirtComponentExceedsRequestedMemory)
+  Playbook: Restart virt-api deployment; check webhook cert validity and
+            expiry; verify service endpoints
+
+KCP-03 [B] virt-handler not ready on node
+  Signal : kube_daemonset_status_number_unavailable{daemonset="virt-handler"}>0
+           (built-in: VirtHandlerDaemonSetRolloutFailing)
+  Playbook: Cordon+drain node; check kubelet status; restart virt-handler;
+            verify node labels match nodeSelector
+
+KCP-04 [C] Webhook cert expiring
+  Signal : Custom cert-expiry exporter:
+           ssl_certificate_expiry_seconds{secret=~"kubevirt.*"} < 7d
+  Playbook: Trigger cert-manager renewal or manual rotation job; test
+            webhooks after rotation
+
+KCP-05 [B] HyperConverged operator degraded
+  Signal : kubevirt_hco_system_health_status != 0
+           (built-in: KubevirtHyperconvergedClusterOperatorCRError)
+  Playbook: Check HCO operator logs; inspect each component CR status;
+            verify all CNV CSVs are Succeeded
+
+================================================================================
+SECTION 4 — OpenShift Core / Kubernetes
+================================================================================
+
+OCP-01 [B] Node NotReady while hosting VMs
+  Signal : kube_node_status_condition{condition="Ready",status="false"}
+           (built-in: KubeNodeNotReady)
+  Playbook: Trigger VM evacuation/live-migration playbook; cordon node;
+            check kubelet; escalate to infra; fence node if hardware failure
+
+OCP-02 [B] Node memory/CPU pressure
+  Signal : kube_node_status_condition{condition="MemoryPressure"} or
+           node_memory_MemAvailable_bytes < threshold
+           (built-in: KubeMemoryOvercommit)
+  Playbook: Cordon node; migrate VMs off; review overcommit ratio;
+            alert infra team
+
+OCP-03 [B] etcd high fsync latency
+  Signal : etcd_disk_wal_fsync_duration_seconds_bucket p99 > 100ms
+           (built-in: etcdHighFsyncDurations)
+  Playbook: Check underlying disk IOPS; isolate etcd to dedicated disks;
+            check etcd peer network; alert infra
+
+OCP-04 [B] API server 5xx error rate high
+  Signal : rate(apiserver_request_total{code=~"5.."}[5m]) /
+           rate(apiserver_request_total[5m]) > 0.01
+           (built-in: KubeAPIErrorBudgetBurn)
+  Playbook: Check API server pod logs; check etcd connectivity; scale API
+            server if load-driven; alert platform team
+
+OCP-05 [C] HugePages exhaustion on VM nodes
+  Signal : node_memory_HugePages_Free < threshold on nodes running VMs
+  Playbook: Adjust HugePage pre-allocation; reschedule HugePages-requiring
+            VMs; reboot node to reclaim
+
+OCP-06 [B] Cluster certificate expiry
+  Signal : apiserver_client_certificate_expiration_seconds p50 < 30d
+           (built-in: KubeClientCertificateExpiration)
+  Playbook: Trigger cert rotation job; verify all components re-bootstrap;
+            test cluster access post-rotation
+
+OCP-07 [B] OLM CSV install/upgrade failed
+  Signal : csv_succeeded==0 for any operator CSV;
+           also csv_abnormal event in Splunk
+  Playbook: Check OLM operator pod logs; check subscription channel;
+            force CSV delete and re-install if stuck
+
+OCP-08 [E] Descheduler aggressively evicting VMI pods
+  Signal : Rate of pod eviction events for virt-launcher pods via Splunk
+           event stream
+  Playbook: Add VMI pod anti-eviction annotation or descheduler exclusion
+            policy; review LowNodeUtilization thresholds
+
+================================================================================
+SECTION 5 — Networking (SR-IOV / Multus / OVN-Kubernetes)
+================================================================================
+
+NET-01 [C] SR-IOV VF pool exhausted
+  Signal : sriov_device_plugin_available_vfs == 0 on a node
+           (custom; SR-IOV device plugin exposes allocatable metric)
+  Playbook: Reschedule VMs to nodes with free VFs; request NIC admin to
+            increase VF count; check sriov-network-operator config
+
+NET-02 [E] Multus NAD misconfiguration
+  Signal : K8s Event reason=FailedCreatePodSandBox with Multus error
+           pattern via Splunk
+  Playbook: Validate NetworkAttachmentDefinition YAML; check OVN-Kubernetes
+            plugin on node; verify IPAM ranges not exhausted
+
+NET-03 [B] OVN-Kubernetes pod failure
+  Signal : up{job="ovnkube-node"}==0 or
+           kube_pod_status_ready{pod=~"ovnkube-.*"}==0
+           (built-in: OVNKubernetesDown)
+  Playbook: Restart ovnkube-node daemonset pod; check br-int bridge on node;
+            verify OVS daemon health
+
+NET-04 [E] Live migration blocked — target node missing secondary network
+  Signal : Migration failure event correlated with target node missing
+           required NetworkAttachmentDefinition label via Splunk
+  Playbook: Fix node labeling; apply NAD to target node; verify Multus config
+            on all migration-eligible nodes
+
+================================================================================
+SECTION 6 — HashiCorp Vault
+================================================================================
+
+VLT-01 [C] Vault sealed
+  Signal : vault_core_unsealed==0 (vault-exporter sidecar) or
+           Vault health endpoint returning 503 via blackbox prober
+  Playbook: Trigger auto-unseal (HSM/KMS); if manual — page on-call, run
+            unseal with quorum of key shares; check audit log for cause
+
+VLT-02 [C] Vault raft leader election failure
+  Signal : vault_raft_leader_lastContact_seconds > threshold or
+           vault_core_leadership_lost_count increasing
+  Playbook: Check raft peer connectivity; verify Vault pods reach each other;
+            restart follower nodes one at a time
+
+VLT-03 [C] Token/lease TTL storm
+  Signal : vault_token_count_by_ttl spike;
+           vault_core_handle_request_blocked high
+  Playbook: Identify noisy client via audit log; revoke orphaned tokens;
+            increase batch-token usage; add rate-limit policy
+
+VLT-04 [C] Vault PKI-issued cert expiry
+  Signal : Custom cert-expiry exporter scanning Vault PKI issued certs;
+           ssl_certificate_expiry_seconds < 7d
+  Playbook: Trigger cert-manager renewal referencing Vault issuer; alert
+            service owner; verify auto-rotation job health
+
+VLT-05 [E] Vault agent sidecar injection failure
+  Signal : K8s Event for init container failure on vault-agent-init via
+           Splunk; also vault_agent_inject_errors counter
+  Playbook: Check Vault agent injector pod; verify Vault policy allows SA;
+            check NetworkPolicy between pod and Vault service
+
+VLT-06 [C] Vault storage backend latency
+  Signal : vault_core_backend_put_operations_duration_seconds p99 > threshold
+  Playbook: Check underlying Vault PVC I/O; check Raft segment size; if on
+            etcd backend check etcd health
+
+VLT-07 [C] Vault audit log write failure
+  Signal : vault_audit_log_request_failure increasing
+  Playbook: Clear/rotate audit log backend; fix audit device connectivity;
+            add secondary audit device for redundancy
+
+================================================================================
+SECTION 7 — Portworx
+================================================================================
+
+PX-01 [B] Portworx node in StorageDown state
+  Signal : px_node_status{status="StorageDown"}
+           (built-in PX alert: NodeStateChange)
+  Playbook: Check underlying block device health on node; check PX journal;
+            restart PX service on node; verify multipath
+
+PX-02 [C] PX volume HA level degraded
+  Signal : px_volume_ha_level < px_volume_replication_factor for a volume
+  Playbook: Check failed replica node; trigger PX volume HA restore once
+            node recovers; alert storage admin
+
+PX-03 [C] PX storage pool near capacity
+  Signal : px_pool_stats_used_bytes / px_pool_stats_total_bytes > 0.8
+  Playbook: Expand pool with new drives; evict/delete old volumes; alert
+            storage capacity team
+
+PX-04 [C] PX volume I/O latency high
+  Signal : px_volume_read_latency_seconds or px_volume_write_latency_seconds
+           p99 > threshold
+  Playbook: Check node disk I/O saturation; consider volume migration to
+            faster pool; check network for shared NVMe
+
+PX-05 [B] PX cluster quorum lost
+  Signal : px_cluster_status{status="NotInQuorum"} or PX alert
+           NodeDecommissionedInvalid via Alertmanager webhook
+  Playbook: Page on-call immediately; restore failed PX nodes; do not attempt
+            volume operations until quorum restored
+
+PX-06 [B] PX internal kvdb failure
+  Signal : px_kvdb_health_state != 1; also PX alert KVDBNotSetup
+  Playbook: Check PX kvdb pods; if external etcd used check etcd health;
+            restart PX on affected nodes in sequence
+
+PX-07 [E] PX volume stuck detaching
+  Signal : K8s VolumeAttachment stuck Attached when expected Detached via
+           Splunk; PX volume state=detaching > 5 minutes
+  Playbook: Force-detach via pxctl; confirm consumer pod is fully terminated;
+            check PX journal for I/O errors
+
+================================================================================
+SECTION 8 — Dell CSM (Container Storage Modules)
+================================================================================
+
+CSM-01 [C] CSI driver node plugin not ready
+  Signal : kube_pod_status_ready{pod=~"dell-csm-.*",container="driver"}==0
+           or DaemonSet unavailable count > 0
+  Playbook: Restart CSM node plugin pod; check iSCSI/FC initiator on node;
+            verify array connectivity; check CSM operator logs
+
+CSM-02 [C] Volume provisioning failure
+  Signal : kube_persistentvolumeclaim_status_phase{phase="Pending"} for
+           CSM StorageClass PVCs > 5m; CSM provisioner error events in Splunk
+  Playbook: Check CSM controller pod logs; verify array credentials in secret;
+            check quota on array; test array API reachability
+
+CSM-03 [C] Array connectivity lost
+  Signal : CSM controller pod error logs (array unreachable); custom:
+           blackbox probe on array management IP
+  Playbook: Check array management network; verify credentials not rotated;
+            check CSM secret; escalate to Dell storage admin
+
+CSM-04 [E] Volume snapshot stuck Creating
+  Signal : volumesnapshot_ready_to_use==false duration > 10m;
+           snapshotcontent errors in Splunk
+  Playbook: Check CSM snapshotter pod logs; verify array snapshot quota;
+            check VolumeSnapshotClass config; retry snapshot
+
+CSM-05 [C] CSM replication RPO breach
+  Signal : csm_replication_rpo_seconds > configured SLA threshold
+           (CSM Replication module exposes this metric)
+  Playbook: Alert DR team; check replication link bandwidth; check array
+            replication logs; escalate if RPO breach confirmed
+
+CSM-06 [C] iSCSI/FC multipath degraded
+  Signal : Custom: node-level multipath checker (multipathd) exporting
+           path count; path_count < expected_paths
+  Playbook: Check HBA/NIC health on node; verify zoning/masking on fabric;
+            restart multipathd; check array port availability
+
+CSM-07 [C] CSM operator upgrade stuck
+  Signal : csv_succeeded{name=~"dell-csm.*"}==0 > 15m;
+           also OLM InstallPlan approval pending
+  Playbook: Check CSM operator pod logs; approve InstallPlan if manual;
+            verify CRD compatibility; rollback if needed
+
+================================================================================
+SECTION 9 — Storage (General OCP / VM Disks)
+================================================================================
+
+STR-01 [C] RWO PVC used for live-migration VM (pre-flight config alert)
+  Signal : Custom static check: VMI evictionStrategy=LiveMigrate AND
+           PVC accessMode=ReadWriteOnce — fire before migration is attempted
+  Playbook: Change PVC access mode to RWX or change evictionStrategy to
+            Evict; alert VM owner
+
+STR-02 [B] Thin-pool storage near depletion
+  Signal : ceph_pool_percent_used > 85 or
+           lvm_lv_usage_bytes / lvm_lv_size_bytes > 0.85
+           (built-in: CephPoolNearFull)
+  Playbook: Expand pool proactively; set Ceph nearfull/backfillfull ratios;
+            alert storage admin before VM disks become read-only
+
+STR-03 [B] Ceph OSD down
+  Signal : ceph_osd_up==0 (built-in: CephOSDDown)
+  Playbook: Check OSD pod logs; check underlying disk health (smartctl);
+            add replacement OSD; monitor rebalance progress
+
+STR-04 [B] Ceph I/O latency spike
+  Signal : ceph_osd_apply_latency_ms p99 > threshold
+           (built-in: CephOSDSlowOps)
+  Playbook: Identify noisy VM or volume; check network between OSDs; check
+            OSD disk queue depth; apply hotspot mitigation
+
+STR-05 [B] Persistent volume nearing full
+  Signal : kubelet_volume_stats_used_bytes /
+           kubelet_volume_stats_capacity_bytes > 0.9
+           (built-in: KubePersistentVolumeFillingUp)
+  Playbook: Alert VM owner; auto-expand if SC supports; run housekeeping
+            inside guest; resize via virtctl
+
+================================================================================
+IMPLEMENTATION GUIDANCE
+================================================================================
+
+1. BUILT-IN ALERTS — wire to playbooks via Alertmanager routes
+   Check existing rules first:
+     oc get prometheusrules -n openshift-cnv -o yaml
+     oc get prometheusrules -n openshift-storage -o yaml
+     kubectl get prometheusrules -n kube-system -o yaml   # Portworx
+   Add routes in Alertmanager config matching alertname and route to playbook
+   webhook/PagerDuty/Opsgenie receiver.
+
+2. CUSTOM ALERTS — write PrometheusRule CRs
+   Key patterns:
+   - Hung transfer: deriv(metric[5m]) < threshold while parent phase active
+   - Duration vs baseline: compare to recording rule tracking p95 over 7d
+   - Capacity: ratio of used/total > threshold with for: 5m
+   - Cert expiry: time() - cert_not_after_timestamp < 7*24*3600
+
+3. EVENT-STREAM ALERTS — K8s Events → Splunk
+   Deploy event-exporter (e.g. kubernetes-event-exporter) to ship K8s
+   Events to Splunk. Build Splunk alerts on:
+   - reason field patterns (ImportFailed, FailedCreatePodSandBox,
+     HotplugVolumeMount, etc.)
+   - involvedObject.namespace + reason combinations
+   Use Splunk alert actions to call Alertmanager API or ticketing system.
+
+4. ALERT PRIORITY TIERS
+   P1 (page immediately): VLT-01 (Vault sealed), PX-05 (quorum lost),
+      OCP-01 (node NotReady+VMs), KV-03 (migration failure loop),
+      STR-03 (OSD down)
+   P2 (alert + auto-remediate): CDI-01 (hung import), KV-02 (hung migration),
+      PX-01 (StorageDown), CSM-03 (array connectivity), OCP-03 (etcd latency)
+   P3 (ticket + monitor): CDI-04 (SLA breach), KV-06 (swap-in), NET-01 (VF
+      exhaustion), VLT-03 (token storm), CSM-05 (RPO breach)
+   P4 (informational/pre-flight): STR-01 (RWO+LiveMigrate config mismatch),
+      KCP-04 (cert expiry warning), OCP-05 (HugePages low)
+
+5. EXPORTERS NEEDED (if not already deployed)
+   - vault-exporter or vault-agent with prometheus telemetry (Vault metrics)
+   - node-exporter (standard; HugePages, network, disk metrics)
+   - blackbox-exporter (Vault health endpoint, array management IPs)
+   - cert-exporter (webhook certs, PKI certs)
+   - kubernetes-event-exporter (K8s Events → Splunk)
+   - CSM metrics endpoint (check CSM operator docs for scrape config)
+   - SR-IOV device plugin metrics endpoint
+
+================================================================================
+TOTAL: 48 alert scenarios
+  Built-in [B]: 18   Custom PromQL [C]: 23   Event-stream [E]: 7
+================================================================================
