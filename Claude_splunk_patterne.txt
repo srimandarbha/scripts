@@ -1,0 +1,400 @@
+================================================================================
+SPLUNK EVENT-BASED ALERT CATALOG (NON-METRIC / LOG & EVENT DETECTION ONLY)
+OpenShift Virtualization + KubeVirt + CDI + Vault + Portworx + Dell CSM + Core
+================================================================================
+Scope note: every entry here has NO reliable Prometheus metric behind it.
+Detection is exclusively via K8s Event objects, container/operator stdout logs,
+audit logs, or node kernel/dmesg output â€” all centralized in Splunk.
+Source column tells you which log stream to build the Splunk search against.
+
+================================================================================
+SECTION 1 â€” CDI / DataVolume Events
+================================================================================
+
+E-CDI-01  Import source unreachable
+  Source : K8s Event, reason=ImportFailed / ErrImportFailed
+  Pattern: index=k8s_events reason=ImportFailed OR "unable to connect to http"
+  Playbook: Validate source URL; check NetworkPolicy; verify pull secret;
+            test proxy config
+
+E-CDI-02  Clone operation failed
+  Source : K8s Event, reason=CloneFailed on target DataVolume
+  Pattern: index=k8s_events reason=CloneFailed
+  Playbook: Check source PVC still exists and is not in use; verify snapshot
+            class supports cloning; check CDI cloner pod logs
+
+E-CDI-03  Upload token/upload operation failed
+  Source : K8s Event, reason=UploadFailed / cdi-uploadproxy pod logs
+  Pattern: index=k8s_pods pod=cdi-uploadproxy* ("upload failed" OR "token expired")
+  Playbook: Regenerate upload token; verify client network path to
+            uploadproxy route; check TLS cert validity
+
+E-CDI-04  DataVolume admission webhook rejection
+  Source : cdi-api / apiserver audit log
+  Pattern: index=k8s_audit objectRef.resource=datavolumes verb=create
+           responseStatus.code>=400
+  Playbook: Inspect webhook denial reason; fix DV spec (storage class,
+            size, source); resubmit
+
+E-CDI-05  Scratch space PVC provisioning failed
+  Source : K8s Event, reason=ProvisioningFailed on scratch-* PVC
+  Pattern: index=k8s_events reason=ProvisioningFailed namespace=cdi
+  Playbook: Check default/scratch StorageClass availability; check
+            provisioner pod health; free capacity if quota-exceeded
+
+E-CDI-06  CDI garbage collection failure (orphaned import pods)
+  Source : cdi-controller pod logs
+  Pattern: index=k8s_pods pod=cdi-controller* "failed to garbage collect"
+  Playbook: Manually delete orphaned importer pods/PVCs; check CDI
+            controller RBAC permissions
+
+================================================================================
+SECTION 2 â€” KubeVirt / VMI / virt-launcher Events
+================================================================================
+
+E-KV-01  Pod sandbox creation failed (network attach)
+  Source : K8s Event, reason=FailedCreatePodSandBox on virt-launcher pod
+  Pattern: index=k8s_events reason=FailedCreatePodSandBox pod=virt-launcher-*
+  Playbook: Check Multus/OVN health on node; validate
+            NetworkAttachmentDefinition; check IPAM pool exhaustion
+
+E-KV-02  VMI sync failure (libvirt/qemu error)
+  Source : virt-handler pod logs
+  Pattern: index=k8s_pods pod=virt-handler* "SyncFailed" OR "failed to sync vmi"
+  Playbook: Inspect libvirt error detail; check node CPU/feature
+            compatibility (nested virt, CPU model); restart virt-handler
+
+E-KV-03  Disk hotplug failure
+  Source : K8s Event, reason=HotplugVolumeMount / virt-launcher logs
+  Pattern: index=k8s_events reason=HotplugVolumeMount status=Warning
+  Playbook: Check CSI node plugin on target node; retry hotplug; verify
+            PVC access mode compatibility
+
+E-KV-04  Guest OS kernel panic / crash
+  Source : VM serial console log (captured via virtctl console / log
+           forwarding sidecar)
+  Pattern: index=vm_console "kernel panic" OR "Oops:" OR "BUG:"
+  Playbook: Capture console dump for guest owner; check if triggered by
+            host resource pressure; recommend guest OS patch/config review
+
+E-KV-05  Live migration aborted â€” unsupported feature/config
+  Source : virt-controller / virt-handler logs
+  Pattern: index=k8s_pods pod=virt-controller* "migration failed" OR
+           "unsupported" AND "LiveMigration"
+  Playbook: Check for hostDevices/SR-IOV/hugepages incompatibility between
+            source and target node; adjust VM spec or node selector
+
+E-KV-06  PCI/GPU/hostDevice allocation failure
+  Source : K8s Event, reason=FailedScheduling with device plugin message /
+           device plugin pod logs
+  Pattern: index=k8s_events reason=FailedScheduling "Insufficient devices.kubevirt.io"
+  Playbook: Check device plugin pod health; verify device availability on
+            candidate nodes; check PCI passthrough config in node BIOS/kernel
+
+E-KV-07  Node Feature Discovery / CPU model mismatch blocking scheduling
+  Source : K8s Event, reason=FailedScheduling referencing node affinity/CPU
+  Pattern: index=k8s_events reason=FailedScheduling "cpu-model" OR "node affinity"
+  Playbook: Verify NFD labels applied correctly; adjust VMI CPU model
+            requirement or add compatible nodes
+
+E-KV-08  VM disk corruption / I/O error inside guest
+  Source : virt-launcher qemu logs
+  Pattern: index=k8s_pods pod=virt-launcher* "I/O error" OR "qemu-kvm: ... error"
+  Playbook: Pause VM; snapshot disk for forensics; check underlying PV/CSI
+            layer for hardware issues; escalate to storage team
+
+================================================================================
+SECTION 3 â€” KubeVirt / CNV Control Plane & Operator Events
+================================================================================
+
+E-KCP-01  Admission webhook denial (VM/VMI spec rejected)
+  Source : kube-apiserver audit log
+  Pattern: index=k8s_audit objectRef.resource=virtualmachines
+           responseStatus.code>=400
+  Playbook: Inspect denial reason (resource limits, template validation);
+            correct VM manifest; resubmit
+
+E-KCP-02  OLM CSV install/upgrade abnormal event
+  Source : K8s Event, reason=InstallSucceeded/Failed on CSV; olm-operator logs
+  Pattern: index=k8s_events reason=InstallPlanFailed OR CSVFailed
+  Playbook: Check OLM operator logs; approve pending InstallPlan if manual
+            approval mode; check CRD version compatibility
+
+E-KCP-03  HCO reconcile error
+  Source : hyperconverged-cluster-operator pod logs
+  Pattern: index=k8s_pods pod=hyperconverged-cluster-operator*
+           "reconcile error" OR "failed to reconcile"
+  Playbook: Inspect specific component CR referenced in error; fix
+            underlying CR spec; force reconcile with annotation bump
+
+================================================================================
+SECTION 4 â€” Networking (Multus / SR-IOV / OVN-Kubernetes)
+================================================================================
+
+E-NET-01  Multus NAD misconfiguration / attach failure
+  Source : K8s Event, reason=FailedCreatePodSandBox; multus logs
+  Pattern: index=k8s_pods pod=multus* "error adding container to network"
+  Playbook: Validate NetworkAttachmentDefinition YAML syntax and CNI plugin
+            config; check IPAM range not exhausted
+
+E-NET-02  IPAM pool exhausted (Whereabouts/static)
+  Source : whereabouts / multus logs
+  Pattern: index=k8s_pods pod=multus* "no more IPs" OR "IP pool exhausted"
+  Playbook: Expand IP pool range in NAD; clean up leaked IP reservations;
+            check for stuck IPAM leases from deleted pods
+
+E-NET-03  OVN logical flow / ACL programming error
+  Source : ovnkube-node / ovnkube-master pod logs
+  Pattern: index=k8s_pods pod=ovnkube-* "failed to add logical flow" OR
+           "OVN Northbound DB" error
+  Playbook: Restart affected ovnkube-node pod; check OVN NBDB/SBDB
+            consistency; check br-int bridge status via ovs-vsctl
+
+E-NET-04  DNS resolution failure impacting VM/pod
+  Source : CoreDNS pod logs
+  Pattern: index=k8s_pods pod=dns-default* "SERVFAIL" OR "connection refused"
+  Playbook: Check CoreDNS pod health and upstream resolver reachability;
+            check corefile config; restart CoreDNS pods
+
+E-NET-05  MAC/IP address conflict detected
+  Source : ovnkube logs / dhcp lease logs
+  Pattern: index=k8s_pods "duplicate address detected" OR "MAC conflict"
+  Playbook: Identify conflicting VMI/pod; regenerate MAC via
+            kubemacpool annotation; check static IP allocation config
+
+E-NET-06  Live migration blocked â€” target node lacks secondary network
+  Source : virt-controller logs correlated with node labels
+  Pattern: index=k8s_pods pod=virt-controller* "network not available on
+           target node"
+  Playbook: Apply missing NAD/labels to target node; verify Multus config
+            present cluster-wide for required networks
+
+================================================================================
+SECTION 5 â€” Storage / CSI (General, Ceph/ODF, CSI drivers)
+================================================================================
+
+E-STR-01  Volume mount failure
+  Source : K8s Event, reason=FailedMount
+  Pattern: index=k8s_events reason=FailedMount
+  Playbook: Check CSI node plugin pod on target node; verify volume not
+            already attached elsewhere (multi-attach error); check fsGroup/
+            SELinux context mismatch
+
+E-STR-02  Volume attach failure
+  Source : K8s Event, reason=FailedAttachVolume
+  Pattern: index=k8s_events reason=FailedAttachVolume
+  Playbook: Check CSI controller pod logs; verify cloud/array API
+            reachability; check VolumeAttachment object status
+
+E-STR-03  Multi-Attach error (RWO volume claimed by two pods)
+  Source : K8s Event, reason=FailedAttachVolume, message contains
+           "Multi-Attach error"
+  Pattern: index=k8s_events "Multi-Attach error"
+  Playbook: Identify stuck terminating pod holding the volume; force delete
+            if node is confirmed dead; do NOT force delete if node is healthy
+
+E-STR-04  Volume deletion failed (finalizer stuck)
+  Source : K8s Event, reason=VolumeFailedDelete
+  Pattern: index=k8s_events reason=VolumeFailedDelete
+  Playbook: Check CSI controller logs for backend deletion error; manually
+            clear finalizer only after confirming backend volume removed
+
+E-STR-05  Filesystem corruption / fsck errors on node
+  Source : node kernel/dmesg log via node-log forwarder
+  Pattern: index=node_syslog "EXT4-fs error" OR "XFS: corruption" OR
+           "fsck" AND "error"
+  Playbook: Cordon node; schedule fsck/repair; migrate VMs off node before
+            remediation; escalate to storage/hardware team
+
+E-STR-06  Disk I/O / SCSI errors at kernel level
+  Source : node kernel/dmesg
+  Pattern: index=node_syslog "sd 0:" AND ("I/O error" OR "Sense Key")
+  Playbook: Check physical/virtual disk health; correlate with array-side
+            errors; replace disk or failover if hardware fault confirmed
+
+E-STR-07  Volume snapshot creation stuck/failed
+  Source : K8s Event on VolumeSnapshot/VolumeSnapshotContent objects
+  Pattern: index=k8s_events involvedObject.kind=VolumeSnapshot
+           reason=SnapshotCreateError
+  Playbook: Check external-snapshotter pod logs; verify array/backend
+            snapshot quota; check VolumeSnapshotClass driver reference
+
+================================================================================
+SECTION 6 â€” Portworx (Log-Based)
+================================================================================
+
+E-PX-01  Node decommission event
+  Source : PX daemon logs (px-storage pod / journalctl on node)
+  Pattern: index=k8s_pods pod=portworx* "node decommission" OR "NodeDecommissioned"
+  Playbook: Verify decommission was intentional; if unexpected, check for
+            flaky node health checks; re-add node to cluster if needed
+
+E-PX-02  Drive add/remove failure
+  Source : PX daemon logs
+  Pattern: index=k8s_pods pod=portworx* "failed to add drive" OR
+           "drive remove failed"
+  Playbook: Check underlying block device visibility on node (lsblk);
+            verify drive not in use by another process; retry via pxctl
+
+E-PX-03  License expiry warning
+  Source : PX daemon logs
+  Pattern: index=k8s_pods pod=portworx* "license" AND ("expire" OR "expired")
+  Playbook: Renew PX license; check license server connectivity if using
+            floating license
+
+E-PX-04  Volume resize operation failed
+  Source : PX daemon logs / K8s Event on PVC resize
+  Pattern: index=k8s_events reason=VolumeResizeFailed OR
+           index=k8s_pods pod=portworx* "resize failed"
+  Playbook: Check target pool has capacity for resize; verify filesystem
+            supports online resize; retry via pxctl volume update
+
+E-PX-05  Storage pool marked offline in logs (pre-metric-alert detail)
+  Source : PX daemon logs
+  Pattern: index=k8s_pods pod=portworx* "pool" AND "offline"
+  Playbook: Check disk health backing the pool; review dmesg for hardware
+            errors; bring pool back online via pxctl once disk replaced
+
+================================================================================
+SECTION 7 â€” Dell CSM (Log-Based)
+================================================================================
+
+E-CSM-01  Array authentication failure
+  Source : CSM controller pod logs (csi-powerstore / csi-unity / csi-powermax)
+  Pattern: index=k8s_pods pod=dell-csm-controller* "authentication failed" OR
+           "401 Unauthorized"
+  Playbook: Verify array credentials secret not stale/rotated; test
+            credentials directly against array API; update secret and
+            restart controller pod
+
+E-CSM-02  Replication failover/failback event
+  Source : CSM replication controller pod logs (repctl / dell-csm-replicator)
+  Pattern: index=k8s_pods pod=*replicat* "failover" OR "failback"
+  Playbook: Confirm failover was planned (DR test) or unplanned (real
+            outage); verify application layer reconnects to new PV; alert
+            DR/BCP team if unplanned
+
+E-CSM-03  Fabric zoning/masking change detected
+  Source : CSM controller logs correlating array-reported path changes
+  Pattern: index=k8s_pods pod=dell-csm-controller* "masking view" AND
+           ("removed" OR "changed")
+  Playbook: Verify zoning change was authorized; check with SAN team;
+            re-establish paths if change was accidental
+
+E-CSM-04  Volume snapshot/clone operation error
+  Source : CSM controller pod logs
+  Pattern: index=k8s_pods pod=dell-csm-controller* "snapshot" AND
+           ("failed" OR "error")
+  Playbook: Check array-side snapshot quota/consistency group state;
+            check VolumeSnapshotClass driver parameters; retry operation
+
+E-CSM-05  CSM node driver iSCSI/FC login failure
+  Source : dell-csm-node pod logs
+  Pattern: index=k8s_pods pod=dell-csm-node* "iscsiadm" AND "failed" OR
+           "login failed"
+  Playbook: Check target portal reachability from node; verify CHAP
+            credentials if used; check HBA/iSCSI initiator config on node
+
+================================================================================
+SECTION 8 â€” HashiCorp Vault (Audit & Application Logs)
+================================================================================
+
+E-VLT-01  Permission denied spike (policy misconfiguration or attack)
+  Source : Vault audit log
+  Pattern: index=vault_audit response.auth.policy_results.allowed=false
+           | stats count by request.client_token, request.path
+  Playbook: Investigate spike source (client identity + path); check if
+            legitimate policy gap or credential misuse; tighten policy or
+            revoke token
+
+E-VLT-02  Root token used
+  Source : Vault audit log
+  Pattern: index=vault_audit request.client_token_type=root OR
+           "root_token" auth event
+  Playbook: This should almost never happen in steady state â€” treat as a
+            security incident; verify intentional emergency use; rotate
+            root token after use per policy
+
+E-VLT-03  Vault seal event
+  Source : Vault server logs
+  Pattern: index=vault_server "core: vault is sealed" OR "core: seal complete"
+  Playbook: Determine seal cause (manual, error, or auto-seal trigger);
+            begin unseal procedure immediately; page on-call
+
+E-VLT-04  Vault plugin crash
+  Source : Vault server logs
+  Pattern: index=vault_server "plugin" AND ("crashed" OR "failed to start")
+  Playbook: Restart affected secrets engine/plugin mount; check plugin
+            binary version compatibility; review plugin catalog registration
+
+E-VLT-05  DR/Performance replication failure
+  Source : Vault server logs
+  Pattern: index=vault_server "replication" AND ("error" OR "disconnected")
+  Playbook: Check network path between primary and secondary clusters;
+            verify replication token not expired; re-establish replication
+
+E-VLT-06  Unauthorized secret access attempt (security)
+  Source : Vault audit log
+  Pattern: index=vault_audit response.auth.policy_results.allowed=false
+           request.path="secret/data/*"
+  Playbook: Identify requesting identity; confirm not compromised
+            credential; escalate to security team if pattern suggests
+            enumeration/attack
+
+E-VLT-07  Vault agent injector webhook failure
+  Source : vault-agent-injector pod logs
+  Pattern: index=k8s_pods pod=vault-agent-injector* "failed to inject" OR
+           "webhook" AND "error"
+  Playbook: Check injector pod health and webhook cert validity; verify
+            target namespace has correct annotations; check Vault
+            connectivity from injector
+
+================================================================================
+SECTION 9 â€” OpenShift Core / Kubernetes (Events & Audit)
+================================================================================
+
+E-OCP-01  Pod scheduling failure (resources/taints/affinity)
+  Source : K8s Event, reason=FailedScheduling
+  Pattern: index=k8s_events reason=FailedScheduling
+  Playbook: Inspect message for cause (insufficient cpu/memory, taint
+            mismatch, affinity conflict); add capacity or adjust scheduling
+            constraints
+
+E-OCP-02  Image pull failure
+  Source : K8s Event, reason=Failed / ErrImagePull / ImagePullBackOff
+  Pattern: index=k8s_events reason=Failed "ErrImagePull" OR "ImagePullBackOff"
+  Playbook: Verify image reference and tag exist; check pull secret;
+            check registry reachability/rate limiting
+
+E-OCP-03  Container OOMKilled (event detail â€” root cause context)
+  Source : K8s Event, reason=OOMKilling / kubelet logs
+  Pattern: index=k8s_events reason=OOMKilling OR
+           index=node_syslog "Out of memory: Killed process"
+  Playbook: Identify which process/container was killed; adjust resource
+            limits; check for memory leak in application
+
+E-OCP-04  Kubelet eviction due to node pressure
+  Source : kubelet logs
+  Pattern: index=k8s_pods pod=kubelet OR index=node_syslog
+           "Evicting pod" AND ("memory pressure" OR "disk pressure")
+  Playbook: Identify evicted workloads; check node capacity planning;
+            add eviction thresholds tuning if premature
+
+E-OCP-05  PLEG (Pod Lifecycle Event Generator) not healthy
+  Source : kubelet logs
+  Pattern: index=node_syslog "PLEG is not healthy"
+  Playbook: Check container runtime (CRI-O) health on node; restart
+            crio/kubelet; check for runc/containerd hangs
+
+E-OCP-06  RBAC / unauthorized API access denial
+  Source : kube-apiserver audit log
+  Pattern: index=k8s_audit responseStatus.code=403
+           | stats count by user.username, objectRef.resource
+  Playbook: Determine if legitimate misconfiguration or malicious probing;
+            correct RoleBinding if legitimate; escalate to security if
+            pattern suggests privilege escalation attempt
+
+E-OCP-07  Privilege escalation attempt / SCC violation
+  Source : kube-apiserver audit log / SecurityContextConstraint denial event
+  Pattern: index=k8s_audit "SecurityContextConstraint" AND "denied" OR
+           index=k8s_events reason=FailedCreate "unable to valid
