@@ -1,0 +1,126 @@
+An overview of the Prometheus metrics, Kubernetes events (oc get events), and pod log patterns (oc logs) generated across all components within the openshift-machine-config-operator project.
+MCO Architecture & Pod Components
+The Machine Config Operator manages node OS configurations, Ignition templates, host kernel arguments, CRI-O settings, and kubelet options across the cluster. The namespace openshift-machine-config-operator hosts four primary daemon/controller workloads:
+machine-config-operator: Top-level operator reconciling custom resources (CRs) and managing operand deployments.
+machine-config-controller: Responsible for rendering combined MachineConfigs (rendered-worker-xxx), validating KubeletConfig / ContainerRuntimeConfig, and tracking pool status.
+machine-config-daemon (MCD): DaemonSet running on every cluster node; handles on-node updates (draining, disk writes, RPM-OSTree/container image layering, pivoting, rebooting, drift check).
+machine-config-server (MCS): Serves Ignition files to booting/bootstrapping nodes over secure port 22623.
+1. Prometheus Metrics
+Exposed via metrics endpoints (e.g., port :8797 or :9001):
+Metric Name
+Type
+Labels
+Description / Context
+mcd_state
+GaugeVec
+state, reason
+Current MCD state per node (Done, Working, Degraded). Indicates degradation reasons.
+mcd_update_state
+GaugeVec
+config, err
+Tracks progress/success or failure during configuration updates.
+mcd_kubelet_state
+Gauge
+None
+Health of local Kubelet monitor (0 = Healthy, >0 = Failing health checks).
+mcd_reboots_failed_total
+Counter
+None
+Total number of failed host reboot attempts.
+mcd_pivot_errors_total
+Gauge
+None
+Total number of errors during OSTree/RPM-OSTree image layering or pivot.
+mcd_config_drift
+Gauge
+None
+Unix timestamp of detected config drift on host files/units (0 if no drift).
+mcd_host_os_and_version
+GaugeVec
+os, version
+Operating system and RHCOS version running on the node.
+mcd_local_unsupported_packages
+GaugeVec
+node
+Number of locally layered, unsupported RPM packages installed on the node.
+Standard Controller Metrics
+Counter/Gauge
+controller
+Controller runtime metrics (controller_runtime_reconcile_total, workqueue_depth).
+
+2. Event Patterns (oc get events)
+Captured in cluster events emitted against MachineConfigPool, Node, or ClusterOperator objects:
+Success / Informational Events (Normal)
+Updating: Pool <pool-name> now targeting <rendered-config-name> (MachineConfigPool target changed).
+Completed: Pool <pool-name> has completed update to <rendered-config-name> (All pool nodes updated).
+OperatorVersionChanged: clusteroperator/machine-config version changed from <v1> to <v2>.
+NodeUpdateSuccess: Node successfully applied target MachineConfig and reported Done.
+Rebooting: Node is initiating reboot to apply kernel args or OS updates.
+Warning & "Not Right" Events (Warning)
+SelectingAll: This machineconfigpool is selecting all machineconfigs. A non-empty selector is required.
+PreflightConfigDriftCheckFailed: Preflight config drift check failed: <error_details>
+ConfigDriftDetected: On-disk state diverges from desired MachineConfig specification.
+NodeDegraded: Node reported Degraded state to MCC/MCO due to update failure, drain failure, or bad ignition/file content.
+KubeletHealthCheckFailed: Local Kubelet monitor threshold exceeded (>2 failed health checks).
+3. Log Patterns (oc logs <pod>)
+A. machine-config-operator Pod
+Log filter: oc logs deploy/machine-config-operator -n openshift-machine-config-operator
+Success Patterns:
+ClusterOperator machine-config: Available: True, Progressing: False, Degraded: False
+Applied manifest ... successfully
+Successfully synced MachineConfigPools
+Warning Patterns:
+Retrying sync of resource <resource-name>
+ClusterOperator machine-config is Progressing: <reason>
+Failure / Error / "Not Right" Patterns:
+failed to connect to feature gates: <err>
+error syncing ClusterOperator: <err>
+ClusterOperator machine-config is Degraded: <reason>
+B. machine-config-controller Pod
+Log filter: oc logs deploy/machine-config-controller -n openshift-machine-config-operator -c machine-config-controller
+Success Patterns:
+Started syncing machineconfigpool "<pool>" ... Finished syncing machineconfigpool "<pool>"
+Rendered MachineConfig rendered-<pool>-<hash> generated successfully
+Pool <pool> has completed update to rendered-<pool>-<hash>
+Warning Patterns:
+Error syncing machineconfigpool <pool>: <err>, retrying
+This machineconfigpool is selecting all machineconfigs
+Dropping <resource> "<key>" out of the queue: <err>
+Failure / Error / "Not Right" Patterns:
+Could not find our MachineConfigNode for node <node-name>: <err>
+Unreconcilable MachineConfig: conflict detected in <path>
+Validation failed for KubeletConfig / ContainerRuntimeConfig: <err>
+could not update MachineConfigPool "<pool>": <err>
+C. machine-config-daemon Pods
+Log filter: oc logs ds/machine-config-daemon -n openshift-machine-config-operator -c machine-config-daemon
+Success Patterns:
+Starting to manage node: <node-name>
+Preflight config drift check successful (took ...)
+Setting node state to Working
+Applying target MachineConfig rendered-<pool>-<hash>
+Setting node state to Done
+Graceful reboot initiated
+Warning Patterns:
+Could not get node state when initializing config drift metric
+Kubelet health check ping failed (attempt X/Y)
+Sleeping 1 minute for retry
+Config drift detected: <path> mode/content mismatch
+Failure / Error / "Not Right" Patterns:
+Preflight config drift check failed: <err>
+Setting node state to Degraded: <error-message>
+Failed to drain node: <err>
+RPM-OSTree / container image layering failed: <err>
+Kubelet health threshold exceeded: <err>
+Pivot failed: <err>
+Reboot failed: <err>
+D. machine-config-server Pods
+Log filter: oc logs deploy/machine-config-server -n openshift-machine-config-operator
+Success Patterns:
+Launching server on :22623
+GET /config/<pool> HTTP/1.1 200
+Certificate watcher started
+Failure / Error / "Not Right" Patterns:
+Machine Config Server exited with error: <err>
+failed to load serving cert: <err>
+GET /config/<pool> HTTP/1.1 500 (Occurs if target rendered config was deleted or lost)
+GET /config/<pool> HTTP/1.1 404 (Pool or machine config not found)
