@@ -1,0 +1,142 @@
+Here is the complete reference formatted in dedicated code blocks for quick copying, terminal piping, and monitoring setup (Loki/Fluentd/Alertmanager).
+
+1. Prometheus Metrics
+Plaintext
+# MCD Node State Metrics
+mcd_state{state="Degraded"}
+mcd_state{state="Working"}
+mcd_state{state="Done"}
+mcd_update_state{config="", err=""}
+
+# MCD Health & Failure Metrics
+mcd_kubelet_state
+mcd_reboots_failed_total
+mcd_pivot_errors_total
+mcd_config_drift
+mcd_local_unsupported_packages
+mcd_host_os_and_version
+Useful PromQL Alert Expressions
+Code snippet
+# Alert on any Degraded MCO Node
+mcd_state{state="Degraded"} > 0
+
+# Alert on Kubelet Monitor Failures
+mcd_kubelet_state > 0
+
+# Alert on Configuration Drift
+mcd_config_drift > 0
+
+# Alert on Failed Host Reboots
+increase(mcd_reboots_failed_total[5m]) > 0
+2. Kubernetes Event Reasons (oc get events)
+Filter Commands
+Bash
+# Get all Warning events across the MCO namespace
+oc get events -n openshift-machine-config-operator --field-selector type=Warning
+
+# Search for specific failure/degraded event reasons
+oc get events -A --field-selector reason=NodeDegraded
+oc get events -A --field-selector reason=ConfigDriftDetected
+oc get events -A --field-selector reason=PreflightConfigDriftCheckFailed
+Event Reasons Reference List
+Plaintext
+# Success / Normal Event Reasons
+Updating
+Completed
+OperatorVersionChanged
+NodeUpdateSuccess
+Rebooting
+
+# Warning / Error Event Reasons
+SelectingAll
+PreflightConfigDriftCheckFailed
+ConfigDriftDetected
+NodeDegraded
+KubeletHealthCheckFailed
+3. Terminal Log Commands & Grep Patterns
+A. Machine Config Operator (machine-config-operator)
+Bash
+# Stream MCO Operator logs
+oc logs deploy/machine-config-operator -n openshift-machine-config-operator -f
+Plaintext
+# SUCCESS / INFO PATTERNS
+"ClusterOperator machine-config: Available: True"
+"Applied manifest"
+"Successfully synced MachineConfigPools"
+
+# ERROR / WARNING PATTERNS
+"error syncing ClusterOperator"
+"ClusterOperator machine-config is Degraded"
+"failed to connect to feature gates"
+"Retrying sync of resource"
+Bash
+# One-liner to match errors in Operator logs
+oc logs deploy/machine-config-operator -n openshift-machine-config-operator | grep -E "(error|Degraded|failed)"
+B. Machine Config Controller (machine-config-controller)
+Bash
+# Stream MCC logs
+oc logs deploy/machine-config-controller -n openshift-machine-config-operator -c machine-config-controller -f
+Plaintext
+# SUCCESS / INFO PATTERNS
+"Rendered MachineConfig"
+"generated successfully"
+"has completed update to"
+"Finished syncing machineconfigpool"
+
+# ERROR / WARNING PATTERNS
+"Error syncing machineconfigpool"
+"Unreconcilable MachineConfig"
+"Validation failed for"
+"Could not find our MachineConfigNode"
+"conflict detected in"
+"Dropping"
+Bash
+# One-liner to check pool sync failures
+oc logs deploy/machine-config-controller -n openshift-machine-config-operator -c machine-config-controller | grep -E "(Error|Unreconcilable|Validation failed|conflict)"
+C. Machine Config Daemon (machine-config-daemon)
+Bash
+# Stream logs from a specific node's daemon
+oc logs ds/machine-config-daemon -n openshift-machine-config-operator -c machine-config-daemon -f
+Plaintext
+# SUCCESS / INFO PATTERNS
+"Starting to manage node"
+"Preflight config drift check successful"
+"Setting node state to Working"
+"Applying target MachineConfig"
+"Setting node state to Done"
+"Graceful reboot initiated"
+
+# ERROR / WARNING PATTERNS
+"Setting node state to Degraded"
+"Preflight config drift check failed"
+"Config drift detected"
+"Failed to drain node"
+"RPM-OSTree"
+"container image layering failed"
+"Kubelet health threshold exceeded"
+"Pivot failed"
+"Reboot failed"
+Bash
+# One-liner to find all degraded nodes or update errors across daemonsets
+oc logs ds/machine-config-daemon -n openshift-machine-config-operator -c machine-config-daemon --all-containers | grep -E "(Degraded|failed|drift detected|exceeded)"
+D. Machine Config Server (machine-config-server)
+Bash
+# Stream MCS logs
+oc logs deploy/machine-config-server -n openshift-machine-config-operator -f
+Plaintext
+# SUCCESS / INFO PATTERNS
+"Launching server on :22623"
+"GET /config/" "200"
+"Certificate watcher started"
+
+# ERROR / WARNING PATTERNS
+"GET /config/" "500"
+"GET /config/" "404"
+"failed to load serving cert"
+"Machine Config Server exited with error"
+Bash
+# One-liner to view failed ignition requests during node bootstrap
+oc logs deploy/machine-config-server -n openshift-machine-config-operator | grep -E "( 500 | 404 |failed|exited)"
+4. Master Regex for Log Aggregators (Grafana Loki / Vector / Elastic)
+Code snippet
+(?i)(Setting node state to Degraded|Preflight config drift check failed|Config drift detected|Unrec
