@@ -1,0 +1,197 @@
+Complete reference guide for Argo CD (and Red Hat OpenShift GitOps) covering Prometheus metrics, Kubernetes/Argo events, Application custom resource statuses (oc get app), and container log patterns (oc logs).
+
+Namespace Note: Commands use standard openshift-gitops (default for OpenShift GitOps). Replace with argocd if using upstream Argo CD.
+
+1. Prometheus Metrics
+Exposed via component metrics ports (Controller :8082, Repo Server :8084, Server :8083, AppSet :8088).
+
+Plaintext
+# Application Status & Health Metrics
+argocd_app_info{name="",namespace="",project="",sync_status="",health_status="",dest_server="",repo=""}
+argocd_app_created_time{name="",namespace="",project=""}
+
+# Reconciliation & Sync Performance
+argocd_app_reconcile_count{name="",namespace="",dest_server=""}
+argocd_app_reconcile_bucket{le=""}
+argocd_app_sync_total{name="",namespace="",project="",phase=""} # phase="Succeeded"|"Failed"|Error"
+
+# K8s API & Cluster Connection Health
+argocd_cluster_api_resource_objects{server=""}
+argocd_cluster_connect_succeeded{server=""} # 1 = connected, 0 = failed
+argocd_cluster_events_total{server="",reason=""}
+
+# Repo Server Metrics
+argocd_repo_pending_request_total
+argocd_git_request_total{repo="",request_type=""}
+argocd_git_request_duration_seconds_bucket{le="",repo="",request_type=""}
+
+# ApplicationSet Controller Metrics
+argocd_appset_reconcile_count{name="",namespace=""}
+Useful PromQL Alert Expressions
+Code snippet
+# Alert on any Degraded Argo Application
+argocd_app_info{health_status="Degraded"} > 0
+
+# Alert on OutOfSync Argo Application
+argocd_app_info{sync_status="OutOfSync"} > 0
+
+# Alert on Unknown Sync or Health State
+argocd_app_info{health_status="Unknown"} > 0 or argocd_app_info{sync_status="Unknown"} > 0
+
+# Alert on Application Sync Failures
+increase(argocd_app_sync_total{phase=~"Failed|Error"}[5m]) > 0
+
+# Alert on Destination Cluster Disconnections
+argocd_cluster_connect_succeeded == 0
+
+# Alert on Repo Server Backlog / High Pending Requests
+argocd_repo_pending_request_total > 10
+2. Status Tracking & Events (oc get app, oc get events)
+A. Application Health & Sync States (oc get applications)
+Bash
+# Get all applications with Sync and Health status
+oc get applications -n openshift-gitops -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,REVISION:.status.sync.revision
+
+# Find all Degraded or OutOfSync applications
+oc get app -n openshift-gitops -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.sync.status}{"\t"}{.status.health.status}{"\n"}{end}' | grep -E "(Degraded|OutOfSync|Unknown|Missing|Failed)"
+Plaintext
+# SUCCESSFUL STATES
+Sync Status:   Synced
+Health Status: Healthy
+
+# IN-PROGRESS / WARNING STATES
+Sync Status:   OutOfSync
+Health Status: Progressing
+Health Status: Suspended
+
+# FAILURE / ERROR / "NOT RIGHT" STATES
+Sync Status:   Unknown
+Health Status: Degraded
+Health Status: Missing
+Health Status: Unknown
+Sync Phase:    Failed
+Sync Phase:    Error
+B. Kubernetes & Argo Event Patterns (oc get events)
+Bash
+# View all Warning events in OpenShift GitOps / Argo CD namespace
+oc get events -n openshift-gitops --field-selector type=Warning
+
+# Find events related to Application sync or comparison failures
+oc get events -n openshift-gitops --field-selector reason=OperationFailed
+oc get events -n openshift-gitops --field-selector reason=ComparisonError
+Plaintext
+# SUCCESS / NORMAL EVENT REASONS
+OperationStarted      # Sync operation initialized
+OperationCompleted    # Sync successfully finished
+SyncCompleted         # Application resources applied successfully
+ResourceCreated       # Managed resource created in target cluster
+ResourceUpdated       # Managed resource updated in target cluster
+ResourceDeleted       # Pruned resource deleted in target cluster
+
+# WARNING / FAILURE / ERROR EVENT REASONS
+OperationFailed       # Sync failed during execution
+ComparisonError       # Failed to compare desired state against live state (e.g., bad YAML / Helm syntax)
+HealthDegraded        # Application moved into Degraded state
+SetSpecError          # ApplicationSet failing to generate applications from spec
+ClusterUnreachable    # Target cluster API endpoint is down or unreachable
+RepoServerTimeout     # Repo server timed out while rendering manifests
+3. Terminal Log Commands & Grep Patterns
+A. Application Controller (argocd-application-controller)
+Bash
+# Stream Application Controller logs
+oc logs deploy/argocd-application-controller -n openshift-gitops -f
+Plaintext
+# SUCCESS / INFO PATTERNS
+"Successfully synced application"
+"Updated sync status"
+"Health status shifted to Healthy"
+"Reconciled app"
+"Sync operation complete"
+
+# WARNING PATTERNS
+"Application is OutOfSync"
+"Resource requires sync"
+"Failed to sync application (retrying)"
+"Reconciliation takes longer than expected"
+
+# ERROR / FAILURE / "NOT RIGHT" PATTERNS
+"Failed to reconcile app"
+"ComparisonError"
+"Failed sync attempt"
+"Destination cluster unreachable"
+"Unknown error in app reconciliation"
+"Failed to prune resource"
+"Resource health degraded"
+Bash
+# One-liner to match errors/degradations in Application Controller
+oc logs deploy/argocd-application-controller -n openshift-gitops | grep -E "(Failed|ComparisonError|unreachable|degraded|Error)"
+B. Repo Server (argocd-repo-server)
+Bash
+# Stream Repo Server logs
+oc logs deploy/argocd-repo-server -n openshift-gitops -f
+Plaintext
+# SUCCESS / INFO PATTERNS
+"manifest generation complete"
+"git fetch successful"
+"helm template finished"
+"kustomize build complete"
+
+# WARNING PATTERNS
+"git fetch retry"
+"cache miss"
+"manifest generation took long"
+
+# ERROR / FAILURE / "NOT RIGHT" PATTERNS
+"rpc error: code = Unknown"
+"Failed to generate manifests"
+"repository not found"
+"authentication failed"
+"helm template failed"
+"kustomize build failed"
+"git checkout failed"
+"plugin execution failed"
+Bash
+# One-liner to find manifest generation failures
+oc logs deploy/argocd-repo-server -n openshift-gitops | grep -E "(Failed|failed|error|authentication|timed out)"
+C. API Server (argocd-server)
+Bash
+# Stream API Server logs
+oc logs deploy/argocd-server -n openshift-gitops -f
+Plaintext
+# SUCCESS / INFO PATTERNS
+"HTTP/2.0 200"
+"gRPC status OK"
+"User logged in"
+"Sync triggered successfully"
+
+# ERROR / WARNING PATTERNS
+"PermissionDenied"
+"Invalid credentials"
+"gRPC error: Code = Unauthenticated"
+"InternalServerError"
+"Failed to parse Bearer token"
+"Project does not allow destination"
+Bash
+# One-liner to check authentication & RBAC issues
+oc logs deploy/argocd-server -n openshift-gitops | grep -E "(PermissionDenied|Unauthenticated|InternalServerError|Failed)"
+D. ApplicationSet Controller (argocd-applicationset-controller)
+Bash
+# Stream ApplicationSet Controller logs
+oc logs deploy/argocd-applicationset-controller -n openshift-gitops -f
+Plaintext
+# SUCCESS / INFO PATTERNS
+"generated application"
+"successfully updated Application"
+"reconcile complete"
+
+# ERROR / WARNING PATTERNS
+"error generating applications"
+"failed to list git repository"
+"failed to evaluate cluster generator"
+"unrecognized generator type"
+Bash
+# One-liner to check ApplicationSet generation errors
+oc logs deploy/argocd-applicationset-controller -n openshift-gitops | grep -E "(error|failed|unrecognized)"
+4. Master Regex for Log Aggregators (Loki / Fluentd / Vector)
+Code snippet
+(?i)(Failed to reconcile app|ComparisonError|Failed sync attempt|Destination cluster unreachable|Failed to generate manifests|helm template failed|kustomize build failed|Health status shifted to Degraded|OperationFailed|ClusterUnreachable|PermissionDenied)
