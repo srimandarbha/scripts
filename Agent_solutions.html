@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Enterprise AI Agent Problems · nitmonk</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#f6f7f9;
+    --panel:#ffffff;
+    --ink:#141922;
+    --ink-soft:#5a6472;
+    --ink-faint:#8b95a4;
+    --line:#e5e9ef;
+    --line-soft:#eef1f5;
+    --accent:#3b5bdb;      /* indigo */
+    --accent-soft:#eaeeff;
+    --teal:#0c8599;
+    --amber:#e8842b;
+    --rose:#d6336c;
+    --green:#2f9e44;
+    --violet:#7048e8;
+    --shadow:0 1px 2px rgba(20,25,34,.04),0 8px 24px rgba(20,25,34,.06);
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    font-family:'Inter',system-ui,sans-serif;
+    background:var(--bg);
+    color:var(--ink);
+    -webkit-font-smoothing:antialiased;
+    display:flex;flex-direction:column;height:100vh;overflow:hidden;
+  }
+
+  /* ---------- Top bar ---------- */
+  .topbar{
+    display:flex;align-items:center;gap:16px;
+    padding:14px 24px;background:var(--panel);
+    border-bottom:1px solid var(--line);flex:0 0 auto;z-index:20;
+  }
+  .brand{display:flex;align-items:center;gap:12px}
+  .logo{
+    width:36px;height:36px;border-radius:9px;flex:0 0 auto;
+    background:linear-gradient(135deg,#3b5bdb,#7048e8);
+    display:flex;align-items:center;justify-content:center;
+    color:#fff;font-family:'Space Grotesk';font-weight:700;font-size:18px;
+    box-shadow:0 4px 12px rgba(59,91,219,.28);
+  }
+  .brand h1{font-family:'Space Grotesk';font-size:16px;font-weight:600;margin:0;letter-spacing:-.01em}
+  .brand span{display:block;font-size:11.5px;color:var(--ink-faint);font-weight:500;letter-spacing:.02em}
+  .top-meta{margin-left:auto;display:flex;align-items:center;gap:10px}
+  .pill{
+    font-size:12px;color:var(--ink-soft);background:var(--bg);
+    border:1px solid var(--line);padding:6px 12px;border-radius:999px;font-weight:500;
+  }
+  .pill b{color:var(--accent);font-weight:600}
+
+  /* ---------- Layout ---------- */
+  .shell{display:flex;flex:1 1 auto;min-height:0}
+
+  /* ---------- Sidebar ---------- */
+  .sidebar{
+    width:340px;flex:0 0 340px;background:var(--panel);
+    border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;
+  }
+  .search{padding:14px 16px 10px;border-bottom:1px solid var(--line-soft)}
+  .search input{
+    width:100%;border:1px solid var(--line);background:var(--bg);
+    padding:10px 12px 10px 34px;border-radius:10px;font-size:13.5px;color:var(--ink);
+    font-family:inherit;outline:none;transition:.15s;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%238b95a4' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='7' cy='7' r='5'/%3E%3Cpath d='M11 11l3 3'/%3E%3C/svg%3E");
+    background-repeat:no-repeat;background-position:11px center;
+  }
+  .search input:focus{border-color:var(--accent);background-color:#fff}
+  .qlist{overflow-y:auto;flex:1 1 auto;padding:8px 10px 24px}
+  .qlist::-webkit-scrollbar{width:9px}
+  .qlist::-webkit-scrollbar-thumb{background:#d5dae2;border-radius:9px;border:2px solid var(--panel)}
+
+  .cat{margin-top:12px}
+  .cat-head{
+    display:flex;align-items:center;gap:9px;padding:8px 10px 6px;
+    font-family:'Space Grotesk';font-size:11px;font-weight:600;letter-spacing:.08em;
+    text-transform:uppercase;color:var(--ink-faint);
+  }
+  .cat-dot{width:8px;height:8px;border-radius:3px;flex:0 0 auto}
+  .cat-count{margin-left:auto;font-family:'JetBrains Mono';font-size:10.5px;color:var(--ink-faint);
+    background:var(--bg);padding:2px 7px;border-radius:6px}
+
+  .qitem{
+    display:flex;gap:11px;align-items:flex-start;
+    padding:9px 11px;border-radius:10px;cursor:pointer;margin:2px 0;
+    transition:background .12s,transform .12s;
+  }
+  .qitem:hover{background:var(--bg)}
+  .qitem.active{background:var(--accent-soft)}
+  .qitem.active .qnum{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .qitem.active .qtitle{color:var(--accent);font-weight:600}
+  .qnum{
+    flex:0 0 auto;width:26px;height:26px;border-radius:8px;
+    display:flex;align-items:center;justify-content:center;
+    font-family:'JetBrains Mono';font-size:12px;font-weight:500;
+    background:var(--bg);border:1px solid var(--line);color:var(--ink-soft);transition:.12s;
+  }
+  .qtitle{font-size:13.5px;line-height:1.35;color:var(--ink);font-weight:500;padding-top:3px}
+
+  /* ---------- Main ---------- */
+  .main{flex:1 1 auto;display:flex;flex-direction:column;min-width:0;min-height:0}
+  .qheader{padding:20px 34px 4px;flex:0 0 auto}
+  .scenario{
+    max-width:860px;background:linear-gradient(180deg,#fff8f0,#fffdfa);
+    border:1px solid #f4e2cc;border-left:3px solid var(--amber);
+    border-radius:10px;padding:15px 18px;margin-bottom:8px;
+  }
+  .scenario .sc-tag{
+    display:inline-block;font-family:'JetBrains Mono';font-size:10px;font-weight:600;
+    letter-spacing:.06em;text-transform:uppercase;color:var(--amber);
+    background:#fff2e3;padding:3px 8px;border-radius:6px;margin-right:9px;vertical-align:2px;
+  }
+  .scenario .sc-body{font-size:14.5px;line-height:1.62;color:#4a4033}
+  .scenario .sc-body b{color:var(--ink);font-weight:700}
+  .scenario code{font-family:'JetBrains Mono';font-size:12px;background:#f4ead9;padding:1px 5px;border-radius:4px;color:#7a5a2a}
+
+  .tabs{display:flex;gap:4px;padding:18px 34px 0;flex:0 0 auto;border-bottom:1px solid var(--line);background:var(--panel)}
+  .tab{
+    padding:11px 18px;font-size:13.5px;font-weight:600;color:var(--ink-faint);
+    cursor:pointer;border:none;background:none;font-family:'Space Grotesk';
+    border-bottom:2.5px solid transparent;margin-bottom:-1px;transition:.14s;
+    display:flex;align-items:center;gap:8px;
+  }
+  .tab:hover{color:var(--ink-soft)}
+  .tab.active{color:var(--accent);border-color:var(--accent)}
+  .tab svg{width:16px;height:16px}
+
+  .content{flex:1 1 auto;min-height:0;position:relative;background:var(--panel)}
+  .pane{position:absolute;inset:0;overflow:auto;display:none}
+  .pane.show{display:block}
+  .pane::-webkit-scrollbar{width:11px;height:11px}
+  .pane::-webkit-scrollbar-thumb{background:#d5dae2;border-radius:9px;border:3px solid var(--panel)}
+
+  /* Discussion pane — blank canvas for pen-tablet writing */
+  .discuss{
+    min-height:100%;padding:30px 34px 60px;background:var(--panel);
+  }
+
+  /* Architecture pane */
+  .arch{padding:26px 34px 60px;min-height:100%}
+  .arch-lead{
+    display:flex;gap:14px;align-items:flex-start;margin-bottom:20px;
+    background:linear-gradient(180deg,#fbfcfe,#f7f9fc);
+    border:1px solid var(--line);border-radius:12px;padding:16px 18px;
+  }
+  .arch-lead .ic{
+    width:34px;height:34px;border-radius:9px;flex:0 0 auto;background:var(--accent-soft);
+    display:flex;align-items:center;justify-content:center;color:var(--accent);font-weight:700;
+    font-family:'Space Grotesk';
+  }
+  .arch-lead h3{margin:0 0 3px;font-family:'Space Grotesk';font-size:14.5px;font-weight:600}
+  .arch-lead p{margin:0;font-size:13.5px;line-height:1.55;color:var(--ink-soft)}
+
+  .diagram-wrap{
+    border:1px solid var(--line);border-radius:14px;background:
+      radial-gradient(circle at 1px 1px,#e7ebf1 1px,transparent 0);
+    background-size:22px 22px;background-color:#fcfdfe;
+    padding:8px;overflow:auto;box-shadow:var(--shadow);
+  }
+  .diagram-wrap svg{display:block;width:100%;height:auto;min-width:680px}
+
+  .legend{display:flex;flex-wrap:wrap;gap:16px;margin-top:16px;padding:0 4px}
+  .legend .li{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ink-soft)}
+  .legend .sw{width:22px;height:14px;border-radius:4px;border:1.5px solid}
+
+  .detail-section{margin-top:24px}
+  .detail-section h4{
+    font-family:'Space Grotesk';font-size:12px;font-weight:600;letter-spacing:.06em;
+    text-transform:uppercase;color:var(--ink-faint);margin:0 0 14px;
+  }
+  .detail-list{display:flex;flex-direction:column;gap:10px}
+  .detail-item{
+    display:flex;gap:14px;align-items:flex-start;
+    background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:14px 18px;box-shadow:var(--shadow);
+  }
+  .detail-item .di-step{
+    flex:0 0 auto;font-family:'Space Grotesk';font-size:14px;font-weight:700;
+    color:#fff;background:linear-gradient(135deg,#3b5bdb,#7048e8);
+    width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;
+    box-shadow:0 3px 8px rgba(59,91,219,.25);
+  }
+  .detail-item .di-h{font-family:'Space Grotesk';font-size:14px;font-weight:600;color:var(--ink);margin-bottom:3px}
+  .detail-item .di-b{font-size:13.5px;line-height:1.6;color:var(--ink-soft)}
+  .detail-item .di-b b{color:var(--ink);font-weight:600}
+  .detail-item .di-b code{font-family:'JetBrains Mono';font-size:12px;background:var(--accent-soft);color:var(--accent);padding:1px 6px;border-radius:5px}
+
+  .takeaways{margin-top:24px}
+  .takeaways h4{
+    font-family:'Space Grotesk';font-size:12px;font-weight:600;letter-spacing:.06em;
+    text-transform:uppercase;color:var(--ink-faint);margin:0 0 12px;
+  }
+  .tk-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+  .tk{
+    background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:14px 16px;
+    display:flex;gap:11px;align-items:flex-start;
+  }
+  .tk .n{
+    font-family:'JetBrains Mono';font-size:11px;font-weight:500;color:#fff;
+    background:var(--accent);width:20px;height:20px;border-radius:6px;flex:0 0 auto;
+    display:flex;align-items:center;justify-content:center;
+  }
+  .tk p{margin:0;font-size:13px;line-height:1.5;color:var(--ink)}
+  .tk p b{font-weight:600}
+
+  /* SVG node styling helpers via classes */
+  .n-label{font-family:'Inter',sans-serif;font-size:12.5px;font-weight:600;fill:var(--ink)}
+  .n-sub{font-family:'JetBrains Mono';font-size:10px;fill:var(--ink-faint)}
+  .e-label{font-family:'JetBrains Mono';font-size:10px;fill:var(--ink-soft)}
+  .grp-label{font-family:'Space Grotesk';font-size:11px;font-weight:600;fill:var(--ink-faint);letter-spacing:.04em;text-transform:uppercase}
+
+  @media (max-width:1080px){
+    .sidebar{width:290px;flex-basis:290px}
+  }
+  @media (max-width:820px){
+    .shell{flex-direction:column}
+    .sidebar{width:100%;flex-basis:auto;max-height:38vh;border-right:none;border-bottom:1px solid var(--line)}
+    .scenario .sc-body{font-size:13.5px}
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">
+    <div class="logo">n</div>
+    <div>
+      <h1>Enterprise AI Agents · Solution Studio</h1>
+      <span>nitmonk · 30 production problems, walked through live</span>
+    </div>
+  </div>
+  <div class="top-meta">
+    <div class="pill">Problem <b id="posNow">1</b> / 30</div>
+    <div class="pill" id="catPill">AI Safety &amp; Reliability</div>
+  </div>
+</div>
+
+<div class="shell">
+  <aside class="sidebar">
+    <div class="search">
+      <input id="search" type="text" placeholder="Search problems…" autocomplete="off">
+    </div>
+    <nav class="qlist" id="qlist"></nav>
+  </aside>
+
+  <main class="main">
+    <div class="qheader">
+      <div class="scenario" id="hScenario">
+        <span class="sc-tag">Real-world scenario</span>
+        <span class="sc-body" id="hQuestion">—</span>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" data-pane="discuss" id="tabDiscuss">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5h12M4 9h8M4 13h10" stroke-linecap="round"/></svg>
+        Discussion
+      </button>
+      <button class="tab" data-pane="arch" id="tabArch">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="3" width="6" height="5" rx="1.2"/><rect x="11" y="12" width="6" height="5" rx="1.2"/><path d="M6 8v3a1 1 0 0 0 1 1h7" stroke-linecap="round"/></svg>
+        Solution Architecture
+      </button>
+    </div>
+
+    <div class="content">
+      <section class="pane show" id="paneDiscuss">
+        <div class="discuss"></div>
+      </section>
+
+      <section class="pane" id="paneArch">
+        <div class="arch">
+          <div class="arch-lead">
+            <div class="ic"><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2.5" y="3" width="6" height="4.5" rx="1"/><rect x="11.5" y="12.5" width="6" height="4.5" rx="1"/><path d="M5.5 7.5v3.2a1.6 1.6 0 0 0 1.6 1.6h4.4" stroke-linecap="round"/></svg></div>
+            <div>
+              <h3 id="archTitle">Solution flow</h3>
+              <p id="archSummary">—</p>
+            </div>
+          </div>
+          <div class="diagram-wrap">
+            <div id="diagram"></div>
+          </div>
+          <div class="legend" id="legend"></div>
+          <div class="detail-section" id="detailSection">
+            <h4>Solution structure — layer by layer</h4>
+            <div class="detail-list" id="detailList"></div>
+          </div>
+          <div class="takeaways">
+            <h4>Design decisions to highlight on camera</h4>
+            <div class="tk-grid" id="takeaways"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<script>
+/* ============================================================
+   Diagram helpers — build SVG box-and-arrow diagrams.
+   Coordinate system is a fixed viewBox; boxes place by x,y.
+   ============================================================ */
+const PALETTE = {
+  in:    {fill:'#eef2ff', stroke:'#3b5bdb', text:'#1e3a8a'},  // input / user
+  proc:  {fill:'#ffffff', stroke:'#94a3b8', text:'#141922'},  // process
+  guard: {fill:'#fff4e6', stroke:'#e8842b', text:'#8a4b0a'},  // guardrail / safety
+  data:  {fill:'#e7f5ff', stroke:'#0c8599', text:'#095566'},  // datastore
+  model: {fill:'#f3f0ff', stroke:'#7048e8', text:'#432c8a'},  // LLM / model
+  human: {fill:'#ffe3e8', stroke:'#d6336c', text:'#8a1740'},  // human
+  ok:    {fill:'#ebfbee', stroke:'#2f9e44', text:'#1a5a2a'},  // success / output
+  danger:{fill:'#fff0f0', stroke:'#e03131', text:'#8a1a1a'},  // attack / failure
+};
+
+const LEGEND_ITEMS = {
+  in:'User / Input', proc:'Process', guard:'Guardrail / Safety',
+  data:'Datastore', model:'LLM', human:'Human review', ok:'Output', danger:'Threat / Failure'
+};
+
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+/* wrap text into <=n chars lines */
+function wrap(text, max){
+  const words = String(text).split(/\s+/); const lines=[]; let cur='';
+  for(const w of words){
+    if((cur+' '+w).trim().length>max){ if(cur)lines.push(cur); cur=w; }
+    else cur=(cur+' '+w).trim();
+  }
+  if(cur)lines.push(cur);
+  return lines;
+}
+
+/* A box. opts: {x,y,w,h,kind,label,sub} returns svg string.
+   x,y = top-left. */
+function box(o){
+  const p = PALETTE[o.kind]||PALETTE.proc;
+  const w=o.w, h=o.h, x=o.x, y=o.y, r=10;
+  const cx=x+w/2;
+  const labelLines = wrap(o.label, Math.max(10, Math.floor(w/7.6)));
+  const hasSub = !!o.sub;
+  const totalLines = labelLines.length + (hasSub?1:0);
+  const lineH = 15;
+  const startY = y + h/2 - ((totalLines-1)*lineH)/2 + (hasSub?-2:0);
+  let t='';
+  labelLines.forEach((ln,i)=>{
+    t+=`<text x="${cx}" y="${startY+i*lineH}" text-anchor="middle" dominant-baseline="middle" font-family="Inter,sans-serif" font-size="12.5" font-weight="600" fill="${p.text}">${esc(ln)}</text>`;
+  });
+  if(hasSub){
+    t+=`<text x="${cx}" y="${startY+labelLines.length*lineH+1}" text-anchor="middle" dominant-baseline="middle" font-family="JetBrains Mono,monospace" font-size="9.5" fill="${p.text}" opacity=".72">${esc(o.sub)}</text>`;
+  }
+  return `<g><rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}" fill="${p.fill}" stroke="${p.stroke}" stroke-width="1.6"/>${t}</g>`;
+}
+
+/* group / lane rectangle behind boxes */
+function lane(o){
+  const {x,y,w,h,label,color='#cbd5e1'} = o;
+  return `<g>
+    <rect x="${x}" y="${y}" width="${w}" height="${h}" rx="14" fill="${color}0d" stroke="${color}" stroke-width="1.2" stroke-dasharray="5 4"/>
+    <text x="${x+14}" y="${y+18}" font-family="Space Grotesk,sans-serif" font-size="10.5" font-weight="600" letter-spacing=".05em" fill="${color}" text-transform="uppercase">${esc(label).toUpperCase()}</text>
+  </g>`;
+}
+
+/* Arrow from (x1,y1) to (x2,y2). opts: {label, dashed, color, curve} */
+let __arrowId=0;
+function arrow(x1,y1,x2,y2,o={}){
+  const color=o.color||'#94a3b8';
+  const id='ah'+(__arrowId++);
+  const dash=o.dashed?'stroke-dasharray="6 5"':'';
+  let path;
+  if(o.curve){
+    // simple quadratic curve; curve = perpendicular offset
+    const mx=(x1+x2)/2, my=(y1+y2)/2;
+    const dx=x2-x1, dy=y2-y1, len=Math.hypot(dx,dy)||1;
+    const ox=-dy/len*o.curve, oy=dx/len*o.curve;
+    path=`M ${x1} ${y1} Q ${mx+ox} ${my+oy} ${x2} ${y2}`;
+  } else {
+    path=`M ${x1} ${y1} L ${x2} ${y2}`;
+  }
+  let lbl='';
+  if(o.label){
+    const lx=o.lx!=null?o.lx:(x1+x2)/2, ly=o.ly!=null?o.ly:(y1+y2)/2;
+    const wLbl=String(o.label).length*5.4+10;
+    lbl=`<rect x="${lx-wLbl/2}" y="${ly-9}" width="${wLbl}" height="16" rx="4" fill="#fcfdfe" opacity=".92"/>`+
+        `<text x="${lx}" y="${ly+2}" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="9.5" fill="#5a6472">${esc(o.label)}</text>`;
+  }
+  return `<defs><marker id="${id}" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="${color}"/></marker></defs>`+
+    `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.7" ${dash} marker-end="url(#${id})"/>`+lbl;
+}
+
+/* Build a full svg from a spec: {vb:[w,h], els:[...svgStrings]} */
+function svg(vbW, vbH, parts){
+  return `<svg viewBox="0 0 ${vbW} ${vbH}" xmlns="http://www.w3.org/2000/svg" role="img">${parts.join('')}</svg>`;
+}
+/* ==== ENRICHED DATA — real-world scenarios + detailed solution structure ==== */
+window.__P = window.__P || [];
+
+window.CATS = {
+  safety:   {name:'AI Safety & Reliability', color:'#e8842b', tag:'AI Safety'},
+  rag:      {name:'RAG at Enterprise Scale', color:'#0c8599', tag:'RAG Scale'},
+  agent:    {name:'Agent Architecture',      color:'#7048e8', tag:'Agents'},
+  security: {name:'Security & Governance',   color:'#d6336c', tag:'Security'},
+  ops:      {name:'Production & Operations',  color:'#2f9e44', tag:'Prod & Ops'},
+};
+
+/* 1 — Probabilistic AI vs Deterministic Transactions */
+window.__P.push({
+  cat:'safety',
+  title:'Probabilistic AI vs Deterministic Transactions',
+  question:'A UPI-style payments app (think PhonePe or a neobank) ships an AI assistant that parses "Pay ₹5,000 to Ravi for rent." The LLM is right 99% of the time — but 1% of ₹10-crore daily volume is ₹10 lakh of wrong or double transfers, and one misread "Ravi" vs "Ravi K." sends money to the wrong account. <b>Since LLMs are probabilistic but the ledger needs deterministic updates, how do you architect this so an incorrect or unintended transaction never occurs?</b>',
+  archSummary:'The LLM never writes to the ledger. It only proposes a structured, typed intent; a deterministic engine validates it against schema + business rules, confirms high-value actions, and commits exactly once with an idempotency key.',
+  detail:[
+    {h:'1 · Intent extraction (probabilistic zone)', b:'The LLM turns natural language into a strict typed object — <code>{action:"transfer", amount:5000, currency:"INR", payee_id:"ravi_k"}</code>. It resolves the payee against the user\'s real contact list, never a free-text name. Ambiguity ("which Ravi?") triggers a clarifying question, not a guess.'},
+    {h:'2 · Deterministic validation gate', b:'Plain code — not the model — checks the JSON schema, types, and business rules: daily limit, sufficient balance, payee on allow-list, velocity checks. Anything malformed is rejected with a
