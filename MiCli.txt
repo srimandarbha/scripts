@@ -1,0 +1,120 @@
+Here is a refined, consolidated draft that seamlessly integrates your CLI use cases into the Telemetry Pipeline & Remediation Architecture.
+Integrated Telemetry, Inventory & Remediation Architecture
+1. Executive Overview
+This architecture unifies real-time telemetry streaming, inventory relational metadata, GitOps release mapping, and automated SRE remediation into a single, high-performance Golang SRE Intelligence API.
+By leveraging a file-decoupled ingestion pipeline, this platform eliminates heavy runtime dependencies (redis_exporter, raw redis-cli calls, K8s API throttling via k8s_info, and direct Splunk queries). It provides two zero-friction consumption layers:
+ * Golang SRE CLI (srectl): A compiled, zero-login binary utilizing trusted machine relationships (mTLS / network identity) for instantaneous CLI diagnostics.
+ * Ansible & Event-Driven Ansible (EDA): Clean, HTTP REST-based playbooks and rulebooks for automated incident response and remediation.
+2. End-to-End Architecture & Data Flow
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                                 DATA SOURCES                                    │
+├──────────────────────┬─────────────────────────────┬────────────────────────────┤
+│  GitOps Repo (GitHub)│   Kafka Stream (OTel/Logs)  │    Inventory DB (Postgres) │
+│  (SIT / Main Merges) │   (Metrics, Events, K8s)    │    (Clusters, Nodes, VMs)  │
+└──────────┬───────────┴──────────────┬──────────────┴──────────────┬─────────────┘
+           │ Webhooks                 │ OTel File Sink              │ Indexed SQL
+           ▼                          ▼                             ▼
+┌─────────────────────────────────────┴───────────────────────────────────────────┐
+│                     BACKGROUND INGESTION & MAPPING DAEMON                       │
+│  (Parses GitOps overlays, writes file logs to Redis via HSET, XADD, EXPIRE)     │
+└─────────────────────────────────────────┬───────────────────────────────────────┘
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         REDIS DATASTORE (TELEMETRY BUFFER)                      │
+│   • metrics:cluster:<id> (Hash)              • logs:cluster:<id> (Capped Stream)│
+│   • alerts:cluster:<id>  (Hash + TTL)        • objects:cluster:<id> (Hash + TTL)│
+└─────────────────────────────────────────┬───────────────────────────────────────┘
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         CENTRAL GOLANG SRE INTELLIGENCE API                     │
+│               (Implicit Auth / mTLS • High-Throughput REST Gateway)             │
+└───────────────────────────┬─────────────────────────────────┬───────────────────┘
+                            │                                 │
+                            ▼                                 ▼
+┌───────────────────────────────────────┐ ┌───────────────────────────────────────┐
+│          Golang SRE CLI (`srectl`)    │ │     Ansible Playbooks & EDA           │
+│    (No Login • Trusted Relationship)  │ │     (HTTP GET via ansible.builtin.uri)│
+└───────────────────────────────────────┘ └───────────────────────────────────────┘
+
+3. Core CLI Use Cases (srectl)
+The Golang CLI embeds mTLS client certificates or network identity headers, allowing SREs to run diagnostics across clusters without authentication prompts.
+1. Blast Radius Analysis (srectl blast-radius)
+ * Use Case: Determine the exact impact of the latest GitOps commit or release tag merging into sit or main.
+ * Execution Logic:
+   * The Webhook Engine parses modified paths in the gitops-standards-repo-template (components/, groups/, overlays/).
+   * Resolves impacted cluster targets (overlays/ \rightarrow clusters/).
+   * Queries Postgres to return total impacted worker nodes, active clusters, and running migrated VMs.
+ * Command Example:
+   $ srectl blast-radius --tag v2.4.1 --env sit
+
+2. Cluster Alert Summaries (srectl alerts)
+ * Use Case: Instantly retrieve active firing alerts for a cluster without querying Prometheus/Alertmanager or Splunk.
+ * Execution Logic: Queries Redis Hash alerts:cluster:<cluster_id>.
+ * Command Example:
+   $ srectl alerts --cluster ocp-prod-01
+
+3. VM Migration Tracking (srectl vms migrated)
+ * Use Case: Audit OpenShift Virtualization (MTV) migrations completed within a given time window.
+ * Execution Logic: Queries indexed Postgres table vm_migrations joined with node/cluster metadata.
+ * Command Example:
+   $ srectl vms migrated --last 24h
+
+4. Real-Time Cluster Utilization (srectl utilization)
+ * Use Case: Fetch the latest CPU, memory, and storage resource utilization for a cluster.
+ * Execution Logic: Reads the latest state snapshot from Redis Hash metrics:cluster:<cluster_id> (sub-millisecond latency).
+ * Command Example:
+   $ srectl utilization --cluster ocp-prod-01
+
+4. Telemetry Ingestion & Data Mapping
+Telemetry written by OpenTelemetry Collector to /var/log/telemetry/*.json is ingested by the background daemon into optimized Redis structures:
+| Telemetry Type | Redis Structure | Ingestion Command | Key Pattern | Retention / TTL |
+|---|---|---|---|---|
+| Metrics | Hash | HSET | metrics:cluster:<cluster_id> | Overwritten continuously (latest state) |
+| Alerts | Hash + Set | HSET & SADD | alerts:cluster:<cluster_id> | Expired per alert state (EXPIRE 24h–48h) |
+| Logs | Stream | XADD with MAXLEN ~ | logs:cluster:<cluster_id> | Capped stream (last 5,000–10,000 logs) |
+| K8s Objects | Hash | HSET | objects:cluster:<cluster_id>:<kind> | Updated on event (EXPIRE 24h) |
+5. Unified API & Ansible Remediation Pipeline
+API Specification Overview
+ * GET /api/v1/blast-radius?tag=<tag>
+ * GET /api/v1/vms/migrated?window=24h
+ * GET /api/v1/telemetry/:cluster_id/metrics
+ * GET /api/v1/telemetry/:cluster_id/alerts
+ * GET /api/v1/telemetry/:cluster_id/logs?limit=100&severity=ERROR
+Ansible Remediation Workflow
+When an incident fires, Ansible interacts exclusively with the Golang API over HTTP—ensuring structured JSON execution without CLI/SSH overhead:
+- name: Automated Cluster Remediation via Telemetry API
+  hosts: localhost
+  gather_facts: false
+  vars:
+    telemetry_api_url: "http://sre-api.infra.svc:8080/api/v1"
+    target_cluster: "ocp-prod-01"
+
+  tasks:
+    - name: Fetch Active Alerts for Target Cluster
+      ansible.builtin.uri:
+        url: "{{ telemetry_api_url }}/telemetry/{{ target_cluster }}/alerts"
+        method: GET
+        return_content: true
+      register: alerts_response
+
+    - name: Fetch Recent Error Logs for Context
+      ansible.builtin.uri:
+        url: "{{ telemetry_api_url }}/telemetry/{{ target_cluster }}/logs?limit=20&severity=ERROR"
+        method: GET
+        return_content: true
+      register: logs_response
+
+    - name: Execute Node Recovery Role
+      ansible.builtin.include_role:
+        name: "roles/node_recovery"
+      when: 
+        - alerts_response.json.data.OOMKilled is defined
+        - logs_response.json.data | length > 0
+
+6. Key Architecture Benefits
+ * Zero Login Friction (srectl): SREs execute CLI commands instantly using internal mTLS trust, removing manual token generation.
+ * API-Driven Abstraction: Eliminates fragile shell tools (redis-cli, kubectl) inside Ansible playbooks in favor of clean HTTP/JSON interfaces.
+ * Controlled Memory Footprint: Capped Redis Streams (MAXLEN ~ 5000) and key TTLs (EXPIRE 86400) ensure stable RAM usage across thousands of managed nodes.
+ * Zero Control Plane Overhead: Bypasses Kubernetes API server throttling (k8s_info) and external logging queries during critical incident remediation loops.
