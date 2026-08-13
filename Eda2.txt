@@ -1,0 +1,224 @@
+# OpenShift Virtualization — Disconnected Bare-Metal EDA Scenario Catalog
+
+Covers **Initiative 2 (Event-Based Actions)**, **Initiative 3 (Adhoc / Day-2 On-Demand)**, **Initiative 4 (Change Management & Approval-Gated Workflows)**, and **Initiative 5 (Fleet-Wide / Multi-Cluster Orchestration)** — the two highest-priority gaps identified when auditing the original three initiatives. Initiative 1 (platform alerts diagnostics & remediation) is out of scope here since it's an existing pipeline — flag if you want it catalogued the same way. Scheduled/preventive maintenance, Day-0/1 cluster bring-up, subscription compliance, and GitOps drift reconciliation remain uncatalogued; say the word if you want any of those next.
+
+## 0. Scope & Assumptions
+
+```
+Alertmanager ──(webhook)──> Kafka[alertmanager-ocpv-events] ──> EDA Rulebook ──> AAP Job Template ──> Playbook ──> Kafka[ocpv-ansible-results]
+Portal(Day-2 UI) ──(publish)──> Kafka[ocpv-adhoc-requests]     ──> EDA Rulebook ──> AAP Job Template ──> Playbook ──> Kafka[ocpv-ansible-results]
+```
+
+- **Stack assumed**: Metal3/BMO (bare-metal lifecycle), ODF or LVMS (storage), MetalLB (LB), kubernetes-nmstate (host networking / NNCP), OADP (backup), cert-manager (internal PKI), oc-mirror + OSUS (disconnected registry/updates), MTV (VM import), Strimzi Kafka / Kafka Bridge (since you're already on OCP). Swap names if your build differs.
+- **Two event shapes feed the same Kafka pipeline**:
+  - **Alert-native** — a PrometheusRule/Alertmanager alert fires on a metric threshold. Clean fit for the alert→Kafka path you already have.
+  - **State-transition** — several triggers below (BareMetalHost phase, DataVolume import success, etc.) are Kubernetes object state changes, not natively alerts. These need either a small recording-rule/exporter that turns the state into a Prometheus alert, or a parallel watch source feeding the same result topic. Flagged per-scenario in the tables so you can decide.
+- **Adhoc requests** are modeled as a second Kafka topic (`ocpv-adhoc-requests`) published by the portal, so both initiatives share one EDA engine and one result contract. If your portal calls the AAP Controller API directly instead, drop the Kafka hop — the job-template/playbook layer is unaffected.
+- **Disconnected constraint**: every collection/module referenced below (`kubernetes.core`, `kubevirt.core`, `community.general`, etc.) must be pre-baked into your AAP Execution Environment image — no dynamic collection installs.
+- **Initiative 4 adds**: AAP Workflow Templates with native Approval nodes (primary pattern) — no new infrastructure needed since it's a platform feature you already have. An external-ITSM-gated alternate is included for shops where CAB approval must live outside AAP.
+- **Initiative 5 adds**: Red Hat Advanced Cluster Management (ACM) as the hub — `ManagedCluster`/`PolicyViolation` objects for fleet visibility, and Topology Aware Lifecycle Manager (TALM) as the production-grade mechanism for canary-wave cluster upgrades specifically (our hand-rolled orchestrator pattern is the general-purpose version for everything that isn't a ClusterVersion upgrade).
+- **IDs**: `EVT-##` = event-based (23), `ADH-##` = adhoc (46), `CHG-##` = change-gated (18), `FLT-##` = fleet campaign (12). 99 scenarios across four initiatives.
+
+## 1. How This Document Is Organized
+
+- **§2** — full scenario catalog, grouped by subsystem, one small table per group
+- **§3** — the reusable execution patterns: §3.1–3.3 for event/adhoc (direct-execute), §3.4 for change-gated (approval required before execute), §3.5 for fleet (campaign/wave execute)
+- **§4** — Kafka schemas: the base job-result contract, plus extensions for change requests (§4.1) and campaigns (§4.2)
+- **§5** — fully worked pseudocode for **20 representative scenarios** (one per subsystem group across Initiatives 2–4). Every other scenario reuses the matching pattern from §3 — only the task block or config changes, and each table row gives you what you need to write it. Initiative 5's variety is entirely config-driven (§3.5's config table), so it doesn't need separate worked examples.
+
+---
+
+## 2. Scenario Catalog
+
+### 2.1 Initiative 2 — Event-Based Actions
+
+*Source legend: **Alert-native** = maps directly to a Prometheus/Alertmanager alert · **State-transition** = K8s object phase change, needs a bridge (see §0).*
+
+#### 2.1.1 Cluster Upgrade & Config
+
+| ID | Trigger / Event | Source | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| EVT-01 | ClusterVersion reaches `Completed` | Alert-native | `jt-ocpv-postupgrade-validate` | ClusterOperators, node Ready, HyperConverged CR, mirror pull test, VM boot per StorageClass, live-migration re-test | §5.1 |
+| EVT-02 | Upgrade fails / ClusterOperator degraded mid-upgrade | Alert-native | `jt-ocpv-upgrade-diag-collect` | Auto must-gather + sosreport, snapshot ClusterOperator conditions, open ticket | skeleton |
+| EVT-03 | MachineConfigPool rollout complete | State-transition | `jt-ocpv-mcp-drift-check` | Config drift check, validate kubelet/CRI-O restarted cleanly | skeleton |
+| EVT-04 | OSUS local update graph refreshed | State-transition | `jt-ocpv-osus-path-validate` | Confirm update path availability against local graph | skeleton |
+
+#### 2.1.2 Bare Metal / Metal3
+
+| ID | Trigger / Event | Source | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| EVT-05 | BareMetalHost → `Provisioned` | State-transition | `jt-ocpv-bmh-baseline` | Firmware/BIOS baseline via Redfish, RAID validation, CMDB push | skeleton |
+| EVT-06 | BareMetalHost → `Error` | State-transition | `jt-ocpv-bmh-error-diag` | Collect Ironic + Redfish logs, open ticket | §5.2 |
+| EVT-07 | BareMetalHost → `Deprovisioned` | State-transition | `jt-ocpv-bmh-decommission` | Decommission cleanup, remove from CMDB/monitoring | skeleton |
+| EVT-08 | Node `Ready` after maintenance/reboot | Alert-native | `jt-ocpv-node-rebalance-check` | VM rebalance check, re-enroll in MetalLB pool | skeleton |
+| EVT-09 | NodeMaintenance CR entered/exited | State-transition | `jt-ocpv-node-maint-check` | Pre-drain live-migration readiness / post-maintenance rebalance | skeleton |
+
+#### 2.1.3 VM / KubeVirt
+
+| ID | Trigger / Event | Source | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| EVT-10 | DataVolume import succeeded (new VM) | State-transition | `jt-ocpv-vm-register` | CMDB/monitoring registration, backup policy tag, default NetworkPolicy | skeleton |
+| EVT-11 | VM deleted | State-transition | `jt-ocpv-vm-cleanup` | Orphaned PVC/DataVolume cleanup, de-registration | skeleton |
+| EVT-12 | VMI live migration succeeded | Alert-native | `jt-ocpv-migration-postcheck` | Connectivity + disk I/O post-check | skeleton |
+| EVT-13 | VMI live migration failed | Alert-native | `jt-ocpv-migration-retry-escalate` | Single retry, then escalate with diagnostics | §5.3 |
+| EVT-14 | Golden image/template import complete | State-transition | `jt-ocpv-image-smoketest` | Automated boot smoke-test + teardown | skeleton |
+
+#### 2.1.4 Storage
+
+| ID | Trigger / Event | Source | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| EVT-15 | ODF/LVMS auto-expand complete | Alert-native | `jt-ocpv-storage-expand-validate` | Validate capacity, re-baseline performance | §5.4 |
+| EVT-16 | DataVolume/PVC resize complete | State-transition | `jt-ocpv-pvc-resize-validate` | Validate in-guest filesystem grew | skeleton |
+| EVT-17 | OADP backup job complete | Alert-native | `jt-ocpv-backup-integrity-check` | Integrity check, periodic restore-test trigger | skeleton |
+| EVT-18 | Ceph `HEALTH_OK` after degraded | Alert-native | `jt-ocpv-ceph-recovery-confirm` | PG recovery confirmation | skeleton |
+
+#### 2.1.5 Network
+
+| ID | Trigger / Event | Source | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| EVT-19 | NodeNetworkConfigurationPolicy applied | State-transition | `jt-ocpv-nncp-validate` | Connectivity/throughput validation, auto-rollback on regression | §5.5 |
+| EVT-20 | cert-manager certificate renewed | Alert-native | `jt-ocpv-cert-renew-rollout` | Dependent pod restart, chain validation vs. local CA bundle | skeleton |
+| EVT-21 | MetalLB IP allocated | State-transition | `jt-ocpv-metallb-reachability` | Service reachability check | skeleton |
+
+#### 2.1.6 Disconnected Registry
+
+| ID | Trigger / Event | Source | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| EVT-22 | oc-mirror sync job complete | State-transition | `jt-ocpv-catalogsource-health` | CatalogSource health check, flag pending operator updates | §5.6 |
+| EVT-23 | IDMS/ICSP update applied | State-transition | `jt-ocpv-pullthrough-validate` | Pull-through validation against local mirror | skeleton |
+
+### 2.2 Initiative 3 — Adhoc / On-Demand Requests
+
+*All rows share one path: Portal → `ocpv-adhoc-requests` topic → EDA (match on `request_type`) → Job Template (see §3.2).*
+
+#### 2.2.1 VM Lifecycle
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-01 | `vm.create` | Create VM from template/instance type/golden image | `jt-ocpv-vm-create` | Provision VM, wait Running, tag for backup/CMDB | §5.7 |
+| ADH-02 | `vm.clone` | Clone existing VM | `jt-ocpv-vm-clone` | Clone spec + disks, register new instance | skeleton |
+| ADH-03 | `vm.power` | Start/stop/restart/pause | `jt-ocpv-vm-power` | Apply requested power state, confirm phase | skeleton |
+| ADH-04 | `vm.delete` | Delete VM (pre-delete snapshot) | `jt-ocpv-vm-delete` | Snapshot, then delete VM + release resources | skeleton |
+| ADH-05 | `vm.migrate` | Live-migrate to specific node | `jt-ocpv-vm-migrate` | Trigger `VirtualMachineInstanceMigration`, validate | skeleton |
+| ADH-06 | `vm.resize` | Hot-plug/resize CPU/Memory | `jt-ocpv-vm-resize` | Patch VM spec, apply live if supported | skeleton |
+| ADH-07 | `vm.capture_template` | Capture running VM as new template | `jt-ocpv-vm-capture` | Snapshot → Template object in catalog | skeleton |
+
+#### 2.2.2 Snapshot, Backup & Export
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-08 | `snapshot.create_restore` | On-demand snapshot create/restore | `jt-ocpv-snapshot-mgmt` | Create/restore `VirtualMachineSnapshot`/`Restore` | §5.8 |
+| ADH-09 | `backup.oadp_trigger` | OADP backup/restore trigger | `jt-ocpv-oadp-trigger` | Kick off Backup/Restore CR, poll status | skeleton |
+| ADH-10 | `vm.export` | VirtualMachineExport (offline transfer) | `jt-ocpv-vm-export` | Create export, generate download token for target cluster | skeleton |
+| ADH-11 | `snapshot.cleanup` | Snapshot retention cleanup | `jt-ocpv-snapshot-cleanup` | Prune snapshots older than policy | skeleton |
+
+#### 2.2.3 Storage
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-12 | `disk.expand` | Expand VM disk/PVC | `jt-ocpv-disk-expand` | Patch PVC size, in-guest filesystem grow | §5.9 |
+| ADH-13 | `disk.attach` | Attach data disk | `jt-ocpv-disk-attach` | Create/attach DataVolume + hotplug | skeleton |
+| ADH-14 | `iso.attach_detach` | Attach/detach install ISO | `jt-ocpv-iso-attach` | Mount/unmount ISO DataVolume as cdrom | skeleton |
+| ADH-15 | `disk.change_storageclass` | Change storage class via clone | `jt-ocpv-disk-sc-migrate` | Clone volume into new SC, repoint VM, validate | skeleton |
+| ADH-16 | `storage.healthcheck` | Storage health/perf check | `jt-ocpv-storage-healthcheck` | Run fio/latency probe, compare to baseline | skeleton |
+
+#### 2.2.4 Networking
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-17 | `net.nic_attach_detach` | Attach/detach NIC | `jt-ocpv-nic-attach` | Patch VM interfaces/networks, hotplug if supported | skeleton |
+| ADH-18 | `net.vlan_change` | Change VLAN/NetworkAttachmentDefinition | `jt-ocpv-vlan-change` | Update NAD, repoint VM interface | skeleton |
+| ADH-19 | `net.static_ip_request` | Request static IP (NNCP) | `jt-ocpv-static-ip-request` | IPAM check + reserve, apply NNCP, verify | §5.10 |
+| ADH-20 | `net.policy_toggle` | Open/close NetworkPolicy port | `jt-ocpv-netpolicy-toggle` | Patch NetworkPolicy, validate reachability | skeleton |
+| ADH-21 | `net.metallb_ip_request` | Request MetalLB IP for new service | `jt-ocpv-metallb-ip-request` | Allocate from pool, patch Service, verify | skeleton |
+
+#### 2.2.5 Bare Metal / Node Ops
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-22 | `node.reboot` | Reboot node | `jt-ocpv-node-reboot` | Graceful reboot, wait Ready, post-check | skeleton |
+| ADH-23 | `node.maintenance` | Cordon/drain/uncordon | `jt-ocpv-node-maintenance` | Live-migration readiness → NodeMaintenance CR / cordon / uncordon | §5.11 |
+| ADH-24 | `node.hw_inventory` | Hardware inventory refresh (Redfish) | `jt-ocpv-hw-inventory` | Pull Redfish inventory, sync to CMDB | skeleton |
+| ADH-25 | `node.raid_rebuild` | RAID rebuild | `jt-ocpv-raid-rebuild` | Trigger controller rebuild, poll progress | skeleton |
+| ADH-26 | `node.firmware_update` | Firmware/BIOS/NIC/HBA update from local repo | `jt-ocpv-firmware-update` | Stage from local repo, apply via Redfish, reboot, verify | skeleton |
+| ADH-27 | `bmh.onboard` | Onboard new BareMetalHost | `jt-ocpv-bmh-onboard` | Create BMH + secret, inspect, provision | skeleton |
+| ADH-28 | `bmh.decommission` | Decommission node | `jt-ocpv-bmh-decommission-adhoc` | Drain, deprovision, wipe, remove from inventory | skeleton |
+
+#### 2.2.6 Access & Security
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-29 | `vm.password_reset` | Reset VM console/admin password | `jt-ocpv-vm-password-reset` | Generate OTP, inject, deliver out-of-band | §5.12 |
+| ADH-30 | `vm.ssh_key` | Inject/rotate SSH key via cloud-init | `jt-ocpv-vm-ssh-key` | Patch cloud-init userData, apply | skeleton |
+| ADH-31 | `vm.console_token` | Generate short-lived console/VNC token | `jt-ocpv-vm-console-token` | Issue scoped token, TTL-bound | skeleton |
+| ADH-32 | `sa.token_rotate` | Rotate service account token | `jt-ocpv-sa-token-rotate` | Issue new token, update secret, invalidate old | skeleton |
+| ADH-33 | `cert.rotate` | On-demand cert rotation | `jt-ocpv-cert-rotate` | Force cert-manager reissue, roll dependents | skeleton |
+
+#### 2.2.7 Compliance & Patching
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-34 | `vm.os_patch` | In-guest OS patch via SSH/virtctl | `jt-ocpv-vm-os-patch` | Point at local repo, patch, reboot if needed, verify | §5.13 |
+| ADH-35 | `scan.openscap` | OpenSCAP scan (VM or node) | `jt-ocpv-openscap-scan` | Run profile scan, publish report | skeleton |
+| ADH-36 | `scan.firmware_compliance` | Firmware compliance scan | `jt-ocpv-firmware-compliance` | Compare installed vs. baseline firmware versions | skeleton |
+
+#### 2.2.8 Diagnostics & Reporting
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-37 | `diag.must_gather` | must-gather/sosreport for VM or node | `jt-ocpv-diag-bundle` | Collect + upload to internal artifact store | §5.14 |
+| ADH-38 | `diag.log_bundle` | Log bundle to support case | `jt-ocpv-log-bundle` | Aggregate logs, attach to ticket | skeleton |
+| ADH-39 | `diag.connectivity_test` | Connectivity test to internal service | `jt-ocpv-connectivity-test` | Probe from VM/node, report latency/result | skeleton |
+| ADH-40 | `report.capacity` | Capacity/utilization report | `jt-ocpv-capacity-report` | Aggregate cluster/VM metrics, publish report | skeleton |
+| ADH-41 | `report.compliance` | Compliance report | `jt-ocpv-compliance-report` | Aggregate scan results across fleet | skeleton |
+
+#### 2.2.9 Disconnected-Specific
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-42 | `registry.resync` | On-demand mirror registry re-sync (oc-mirror) | `jt-ocpv-registry-resync` | Run oc-mirror, apply ICSP/IDMS + CatalogSources | §5.15 |
+| ADH-43 | `ca.redistribute` | Local CA bundle redistribution | `jt-ocpv-ca-redistribute` | Push updated CA bundle to trust stores fleet-wide | skeleton |
+| ADH-44 | `ns.provision` | New namespace/project + quota provisioning | `jt-ocpv-ns-provision` | Create namespace, RBAC, ResourceQuota, NetworkPolicy | skeleton |
+| ADH-45 | `vm.import_mtv` | VM import from VMware/RHV via MTV | `jt-ocpv-vm-import-mtv` | Create MTV Plan, run migration, validate boot | skeleton |
+| ADH-46 | `upgrade.readiness_check` | Pre-upgrade readiness check | `jt-ocpv-upgrade-readiness` | etcd health, storage headroom, mirror content check | skeleton |
+
+### 2.3 Initiative 4 — Change Management & Approval-Gated Workflows
+
+Same intake mechanics as Initiatives 2/3 (an alert or a portal request), but the resource/action is sensitive enough that it must **pause for human sign-off** before the job template runs. Architecturally distinct — see §3.4.
+
+*Pseudocode legend: "§3.4 pattern" = reuse the generic pattern with a different target job template · §5.1x = fully worked example.*
+
+#### 2.3.1 Bare-Metal Destructive / High-Risk Ops
+
+| ID | Trigger | Target Job Template (post-approval) | Why It's Gated | Pseudocode |
+|---|---|---|---|---|
+| CHG-01 | `bmh.decommission` requested | `jt-ocpv-bmh-decommission-adhoc` | Irreversible — wipes and removes hardware from inventory | §5.16 |
+| CHG-02 | `node.raid_rebuild` requested on a host with active workloads | `jt-ocpv-raid-rebuild` | Data-destructive if wrong disk targeted | §3.4 pattern |
+| CHG-03 | `node.firmware_update` requested for a production host | `jt-ocpv-firmware-update` | Risk of bricking hardware at a disconnected site (no easy remote recovery) | §3.4 pattern |
+| CHG-04 | Full re-provision/re-image of a BareMetalHost | `jt-ocpv-bmh-onboard` (with wipe first) | Wipes existing OS/config | §3.4 pattern |
+
+#### 2.3.2 Cluster-Level Changes
+
+| ID | Trigger | Target Job Template (post-approval) | Why It's Gated | Pseudocode |
+|---|---|---|---|---|
+| CHG-05 | Cluster upgrade initiation (the trigger to *start*, distinct from EVT-01's post-check) | `jt-ocpv-upgrade-initiate` | Fleet-visible, hard to fully roll back mid-upgrade | §5.17 |
+| CHG-06 | MachineConfigPool change affecting all nodes (kernel args, disk layout) | `jt-ocpv-mcp-apply` | Rolling reboot of every node in the pool | §3.4 pattern |
+| CHG-07 | etcd defrag or restore-from-backup | `jt-ocpv-etcd-ops` | Cluster-control-plane risk if mistimed | §3.4 pattern |
+| CHG-08 | Cluster-wide internal CA rotation | `jt-ocpv-ca-rotate-cluster` | Breaks trust chains fleet-wide if done wrong | §3.4 pattern |
+
+#### 2.3.3 VM / Workload High-Blast-Radius Ops
+
+| ID | Trigger | Target Job Template (post-approval) | Why It's Gated | Pseudocode |
+|---|---|---|---|---|
+| CHG-09 | `vm.delete` with `vm_count > 5` (bulk delete) | `jt-ocpv-vm-bulk-delete` | Bulk irreversible action, easy to fat-finger a label selector | §5.18 |
+| CHG-10 | Storage-class migration for a production workload | `jt-ocpv-disk-sc-migrate` | Live data movement, downtime risk | §3.4 pattern |
+| CHG-11 | Production VM resize-down (CPU/memory) | `jt-ocpv-vm-resize` | Risk of OOM / performance regression | §3.4 pattern |
+| CHG-12 | Snapshot/backup retention policy change (shortening window) | `jt-ocpv-retention-policy-update` | Risk of losing recovery points | §3.4 pattern |
+
+#### 2.3.4 Access & Security Changes
+
+| ID | Trigger | Target Job Template (post-approval) | Why It's Gated | Pseudocode |
+|---|---|---|---|---|
+| CHG-13 | RBAC / ClusterRoleBinding grant (elevated privilege) | `jt-ocpv-rbac-grant` | Privilege escalation risk | §5.19 |
+| CHG-14 | NetworkPolicy widened to broader access | `jt-ocpv-netpolicy-widen` | Expands attack surface | §3.4 pattern |
+| CHG-15 | Namespace quota i
