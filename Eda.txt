@@ -1,0 +1,1000 @@
+# OpenShift Virtualization — Disconnected Bare-Metal EDA Scenario Catalog
+
+Covers **Initiative 2 (Event-Based Actions)** and **Initiative 3 (Adhoc / Day-2 On-Demand)**. Initiative 1 (platform alerts diagnostics & remediation) is out of scope here since it's an existing pipeline — flag if you want it catalogued the same way.
+
+## 0. Scope & Assumptions
+
+```
+Alertmanager ──(webhook)──> Kafka[alertmanager-ocpv-events] ──> EDA Rulebook ──> AAP Job Template ──> Playbook ──> Kafka[ocpv-ansible-results]
+Portal(Day-2 UI) ──(publish)──> Kafka[ocpv-adhoc-requests]     ──> EDA Rulebook ──> AAP Job Template ──> Playbook ──> Kafka[ocpv-ansible-results]
+```
+
+- **Stack assumed**: Metal3/BMO (bare-metal lifecycle), ODF or LVMS (storage), MetalLB (LB), kubernetes-nmstate (host networking / NNCP), OADP (backup), cert-manager (internal PKI), oc-mirror + OSUS (disconnected registry/updates), MTV (VM import), Strimzi Kafka / Kafka Bridge (since you're already on OCP). Swap names if your build differs.
+- **Two event shapes feed the same Kafka pipeline**:
+  - **Alert-native** — a PrometheusRule/Alertmanager alert fires on a metric threshold. Clean fit for the alert→Kafka path you already have.
+  - **State-transition** — several triggers below (BareMetalHost phase, DataVolume import success, etc.) are Kubernetes object state changes, not natively alerts. These need either a small recording-rule/exporter that turns the state into a Prometheus alert, or a parallel watch source feeding the same result topic. Flagged per-scenario in the tables so you can decide.
+- **Adhoc requests** are modeled as a second Kafka topic (`ocpv-adhoc-requests`) published by the portal, so both initiatives share one EDA engine and one result contract. If your portal calls the AAP Controller API directly instead, drop the Kafka hop — the job-template/playbook layer is unaffected.
+- **Disconnected constraint**: every collection/module referenced below (`kubernetes.core`, `kubevirt.core`, `community.general`, etc.) must be pre-baked into your AAP Execution Environment image — no dynamic collection installs.
+- **IDs**: `EVT-##` = event-based (23 total), `ADH-##` = adhoc (46 total). 69 scenarios.
+
+## 1. How This Document Is Organized
+
+- **§2** — full scenario catalog, grouped by subsystem, one small table per group
+- **§3** — the common EDA rulebook pattern + common playbook skeleton every scenario reuses
+- **§4** — the common Kafka result-topic schema
+- **§5** — fully worked pseudocode for **15 representative scenarios** (one per subsystem group). The other 54 scenarios reuse the exact same skeleton (§3.3) — only the task block changes, and each table row gives you the Job Template name + Action Summary needed to write it.
+
+---
+
+## 2. Scenario Catalog
+
+### 2.1 Initiative 2 — Event-Based Actions
+
+*Source legend: **Alert-native** = maps directly to a Prometheus/Alertmanager alert · **State-transition** = K8s object phase change, needs a bridge (see §0).*
+
+#### 2.1.1 Cluster Upgrade & Config
+
+| ID | Trigger / Event | Source | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| EVT-01 | ClusterVersion reaches `Completed` | Alert-native | `jt-ocpv-postupgrade-validate` | ClusterOperators, node Ready, HyperConverged CR, mirror pull test, VM boot per StorageClass, live-migration re-test | §5.1 |
+| EVT-02 | Upgrade fails / ClusterOperator degraded mid-upgrade | Alert-native | `jt-ocpv-upgrade-diag-collect` | Auto must-gather + sosreport, snapshot ClusterOperator conditions, open ticket | skeleton |
+| EVT-03 | MachineConfigPool rollout complete | State-transition | `jt-ocpv-mcp-drift-check` | Config drift check, validate kubelet/CRI-O restarted cleanly | skeleton |
+| EVT-04 | OSUS local update graph refreshed | State-transition | `jt-ocpv-osus-path-validate` | Confirm update path availability against local graph | skeleton |
+
+#### 2.1.2 Bare Metal / Metal3
+
+| ID | Trigger / Event | Source | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| EVT-05 | BareMetalHost → `Provisioned` | State-transition | `jt-ocpv-bmh-baseline` | Firmware/BIOS baseline via Redfish, RAID validation, CMDB push | skeleton |
+| EVT-06 | BareMetalHost → `Error` | State-transition | `jt-ocpv-bmh-error-diag` | Collect Ironic + Redfish logs, open ticket | §5.2 |
+| EVT-07 | BareMetalHost → `Deprovisioned` | State-transition | `jt-ocpv-bmh-decommission` | Decommission cleanup, remove from CMDB/monitoring | skeleton |
+| EVT-08 | Node `Ready` after maintenance/reboot | Alert-native | `jt-ocpv-node-rebalance-check` | VM rebalance check, re-enroll in MetalLB pool | skeleton |
+| EVT-09 | NodeMaintenance CR entered/exited | State-transition | `jt-ocpv-node-maint-check` | Pre-drain live-migration readiness / post-maintenance rebalance | skeleton |
+
+#### 2.1.3 VM / KubeVirt
+
+| ID | Trigger / Event | Source | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| EVT-10 | DataVolume import succeeded (new VM) | State-transition | `jt-ocpv-vm-register` | CMDB/monitoring registration, backup policy tag, default NetworkPolicy | skeleton |
+| EVT-11 | VM deleted | State-transition | `jt-ocpv-vm-cleanup` | Orphaned PVC/DataVolume cleanup, de-registration | skeleton |
+| EVT-12 | VMI live migration succeeded | Alert-native | `jt-ocpv-migration-postcheck` | Connectivity + disk I/O post-check | skeleton |
+| EVT-13 | VMI live migration failed | Alert-native | `jt-ocpv-migration-retry-escalate` | Single retry, then escalate with diagnostics | §5.3 |
+| EVT-14 | Golden image/template import complete | State-transition | `jt-ocpv-image-smoketest` | Automated boot smoke-test + teardown | skeleton |
+
+#### 2.1.4 Storage
+
+| ID | Trigger / Event | Source | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| EVT-15 | ODF/LVMS auto-expand complete | Alert-native | `jt-ocpv-storage-expand-validate` | Validate capacity, re-baseline performance | §5.4 |
+| EVT-16 | DataVolume/PVC resize complete | State-transition | `jt-ocpv-pvc-resize-validate` | Validate in-guest filesystem grew | skeleton |
+| EVT-17 | OADP backup job complete | Alert-native | `jt-ocpv-backup-integrity-check` | Integrity check, periodic restore-test trigger | skeleton |
+| EVT-18 | Ceph `HEALTH_OK` after degraded | Alert-native | `jt-ocpv-ceph-recovery-confirm` | PG recovery confirmation | skeleton |
+
+#### 2.1.5 Network
+
+| ID | Trigger / Event | Source | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| EVT-19 | NodeNetworkConfigurationPolicy applied | State-transition | `jt-ocpv-nncp-validate` | Connectivity/throughput validation, auto-rollback on regression | §5.5 |
+| EVT-20 | cert-manager certificate renewed | Alert-native | `jt-ocpv-cert-renew-rollout` | Dependent pod restart, chain validation vs. local CA bundle | skeleton |
+| EVT-21 | MetalLB IP allocated | State-transition | `jt-ocpv-metallb-reachability` | Service reachability check | skeleton |
+
+#### 2.1.6 Disconnected Registry
+
+| ID | Trigger / Event | Source | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| EVT-22 | oc-mirror sync job complete | State-transition | `jt-ocpv-catalogsource-health` | CatalogSource health check, flag pending operator updates | §5.6 |
+| EVT-23 | IDMS/ICSP update applied | State-transition | `jt-ocpv-pullthrough-validate` | Pull-through validation against local mirror | skeleton |
+
+### 2.2 Initiative 3 — Adhoc / On-Demand Requests
+
+*All rows share one path: Portal → `ocpv-adhoc-requests` topic → EDA (match on `request_type`) → Job Template (see §3.2).*
+
+#### 2.2.1 VM Lifecycle
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-01 | `vm.create` | Create VM from template/instance type/golden image | `jt-ocpv-vm-create` | Provision VM, wait Running, tag for backup/CMDB | §5.7 |
+| ADH-02 | `vm.clone` | Clone existing VM | `jt-ocpv-vm-clone` | Clone spec + disks, register new instance | skeleton |
+| ADH-03 | `vm.power` | Start/stop/restart/pause | `jt-ocpv-vm-power` | Apply requested power state, confirm phase | skeleton |
+| ADH-04 | `vm.delete` | Delete VM (pre-delete snapshot) | `jt-ocpv-vm-delete` | Snapshot, then delete VM + release resources | skeleton |
+| ADH-05 | `vm.migrate` | Live-migrate to specific node | `jt-ocpv-vm-migrate` | Trigger `VirtualMachineInstanceMigration`, validate | skeleton |
+| ADH-06 | `vm.resize` | Hot-plug/resize CPU/Memory | `jt-ocpv-vm-resize` | Patch VM spec, apply live if supported | skeleton |
+| ADH-07 | `vm.capture_template` | Capture running VM as new template | `jt-ocpv-vm-capture` | Snapshot → Template object in catalog | skeleton |
+
+#### 2.2.2 Snapshot, Backup & Export
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-08 | `snapshot.create_restore` | On-demand snapshot create/restore | `jt-ocpv-snapshot-mgmt` | Create/restore `VirtualMachineSnapshot`/`Restore` | §5.8 |
+| ADH-09 | `backup.oadp_trigger` | OADP backup/restore trigger | `jt-ocpv-oadp-trigger` | Kick off Backup/Restore CR, poll status | skeleton |
+| ADH-10 | `vm.export` | VirtualMachineExport (offline transfer) | `jt-ocpv-vm-export` | Create export, generate download token for target cluster | skeleton |
+| ADH-11 | `snapshot.cleanup` | Snapshot retention cleanup | `jt-ocpv-snapshot-cleanup` | Prune snapshots older than policy | skeleton |
+
+#### 2.2.3 Storage
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-12 | `disk.expand` | Expand VM disk/PVC | `jt-ocpv-disk-expand` | Patch PVC size, in-guest filesystem grow | §5.9 |
+| ADH-13 | `disk.attach` | Attach data disk | `jt-ocpv-disk-attach` | Create/attach DataVolume + hotplug | skeleton |
+| ADH-14 | `iso.attach_detach` | Attach/detach install ISO | `jt-ocpv-iso-attach` | Mount/unmount ISO DataVolume as cdrom | skeleton |
+| ADH-15 | `disk.change_storageclass` | Change storage class via clone | `jt-ocpv-disk-sc-migrate` | Clone volume into new SC, repoint VM, validate | skeleton |
+| ADH-16 | `storage.healthcheck` | Storage health/perf check | `jt-ocpv-storage-healthcheck` | Run fio/latency probe, compare to baseline | skeleton |
+
+#### 2.2.4 Networking
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-17 | `net.nic_attach_detach` | Attach/detach NIC | `jt-ocpv-nic-attach` | Patch VM interfaces/networks, hotplug if supported | skeleton |
+| ADH-18 | `net.vlan_change` | Change VLAN/NetworkAttachmentDefinition | `jt-ocpv-vlan-change` | Update NAD, repoint VM interface | skeleton |
+| ADH-19 | `net.static_ip_request` | Request static IP (NNCP) | `jt-ocpv-static-ip-request` | IPAM check + reserve, apply NNCP, verify | §5.10 |
+| ADH-20 | `net.policy_toggle` | Open/close NetworkPolicy port | `jt-ocpv-netpolicy-toggle` | Patch NetworkPolicy, validate reachability | skeleton |
+| ADH-21 | `net.metallb_ip_request` | Request MetalLB IP for new service | `jt-ocpv-metallb-ip-request` | Allocate from pool, patch Service, verify | skeleton |
+
+#### 2.2.5 Bare Metal / Node Ops
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-22 | `node.reboot` | Reboot node | `jt-ocpv-node-reboot` | Graceful reboot, wait Ready, post-check | skeleton |
+| ADH-23 | `node.maintenance` | Cordon/drain/uncordon | `jt-ocpv-node-maintenance` | Live-migration readiness → NodeMaintenance CR / cordon / uncordon | §5.11 |
+| ADH-24 | `node.hw_inventory` | Hardware inventory refresh (Redfish) | `jt-ocpv-hw-inventory` | Pull Redfish inventory, sync to CMDB | skeleton |
+| ADH-25 | `node.raid_rebuild` | RAID rebuild | `jt-ocpv-raid-rebuild` | Trigger controller rebuild, poll progress | skeleton |
+| ADH-26 | `node.firmware_update` | Firmware/BIOS/NIC/HBA update from local repo | `jt-ocpv-firmware-update` | Stage from local repo, apply via Redfish, reboot, verify | skeleton |
+| ADH-27 | `bmh.onboard` | Onboard new BareMetalHost | `jt-ocpv-bmh-onboard` | Create BMH + secret, inspect, provision | skeleton |
+| ADH-28 | `bmh.decommission` | Decommission node | `jt-ocpv-bmh-decommission-adhoc` | Drain, deprovision, wipe, remove from inventory | skeleton |
+
+#### 2.2.6 Access & Security
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-29 | `vm.password_reset` | Reset VM console/admin password | `jt-ocpv-vm-password-reset` | Generate OTP, inject, deliver out-of-band | §5.12 |
+| ADH-30 | `vm.ssh_key` | Inject/rotate SSH key via cloud-init | `jt-ocpv-vm-ssh-key` | Patch cloud-init userData, apply | skeleton |
+| ADH-31 | `vm.console_token` | Generate short-lived console/VNC token | `jt-ocpv-vm-console-token` | Issue scoped token, TTL-bound | skeleton |
+| ADH-32 | `sa.token_rotate` | Rotate service account token | `jt-ocpv-sa-token-rotate` | Issue new token, update secret, invalidate old | skeleton |
+| ADH-33 | `cert.rotate` | On-demand cert rotation | `jt-ocpv-cert-rotate` | Force cert-manager reissue, roll dependents | skeleton |
+
+#### 2.2.7 Compliance & Patching
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-34 | `vm.os_patch` | In-guest OS patch via SSH/virtctl | `jt-ocpv-vm-os-patch` | Point at local repo, patch, reboot if needed, verify | §5.13 |
+| ADH-35 | `scan.openscap` | OpenSCAP scan (VM or node) | `jt-ocpv-openscap-scan` | Run profile scan, publish report | skeleton |
+| ADH-36 | `scan.firmware_compliance` | Firmware compliance scan | `jt-ocpv-firmware-compliance` | Compare installed vs. baseline firmware versions | skeleton |
+
+#### 2.2.8 Diagnostics & Reporting
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-37 | `diag.must_gather` | must-gather/sosreport for VM or node | `jt-ocpv-diag-bundle` | Collect + upload to internal artifact store | §5.14 |
+| ADH-38 | `diag.log_bundle` | Log bundle to support case | `jt-ocpv-log-bundle` | Aggregate logs, attach to ticket | skeleton |
+| ADH-39 | `diag.connectivity_test` | Connectivity test to internal service | `jt-ocpv-connectivity-test` | Probe from VM/node, report latency/result | skeleton |
+| ADH-40 | `report.capacity` | Capacity/utilization report | `jt-ocpv-capacity-report` | Aggregate cluster/VM metrics, publish report | skeleton |
+| ADH-41 | `report.compliance` | Compliance report | `jt-ocpv-compliance-report` | Aggregate scan results across fleet | skeleton |
+
+#### 2.2.9 Disconnected-Specific
+
+| ID | Request Type | Scenario | Job Template | Action Summary | Pseudocode |
+|---|---|---|---|---|---|
+| ADH-42 | `registry.resync` | On-demand mirror registry re-sync (oc-mirror) | `jt-ocpv-registry-resync` | Run oc-mirror, apply ICSP/IDMS + CatalogSources | §5.15 |
+| ADH-43 | `ca.redistribute` | Local CA bundle redistribution | `jt-ocpv-ca-redistribute` | Push updated CA bundle to trust stores fleet-wide | skeleton |
+| ADH-44 | `ns.provision` | New namespace/project + quota provisioning | `jt-ocpv-ns-provision` | Create namespace, RBAC, ResourceQuota, NetworkPolicy | skeleton |
+| ADH-45 | `vm.import_mtv` | VM import from VMware/RHV via MTV | `jt-ocpv-vm-import-mtv` | Create MTV Plan, run migration, validate boot | skeleton |
+| ADH-46 | `upgrade.readiness_check` | Pre-upgrade readiness check | `jt-ocpv-upgrade-readiness` | etcd health, storage headroom, mirror content check | skeleton |
+
+---
+
+## 3. Common Patterns
+
+### 3.1 EDA Rulebook — Event-Based (Initiative 2)
+
+```yaml
+---
+- name: OCP Virt Disconnected BM - Event-Based Actions
+  hosts: all
+  sources:
+    - ansible.eda.kafka:
+        host: "{{ kafka_bootstrap_host }}"
+        port: "{{ kafka_port }}"
+        topic: "alertmanager-ocpv-events"
+        group_id: "eda-ocpv-baremetal-events"
+        security_protocol: "SASL_SSL"
+        sasl_mechanism: "SCRAM-SHA-512"
+        sasl_username: "{{ kafka_user }}"
+        sasl_password: "{{ kafka_password }}"
+        cafile: "{{ internal_ca_bundle }}"   # disconnected: internal CA, not public
+
+  rules:
+    - name: EVT-01 Post-upgrade validation
+      condition: >
+        event.payload.labels.alertname == "OCPVirtUpgradeCompleted"
+        and event.payload.status == "firing"
+      action:
+        run_job_template:
+          name: "jt-ocpv-postupgrade-validate"
+          organization: "OCP-Virt"
+          job_args:
+            extra_vars:
+              correlation_id: "{{ event.payload.fingerprint }}"
+              cluster: "{{ event.payload.labels.cluster }}"
+
+    - name: EVT-06 BareMetalHost Error diagnostics
+      condition: >
+        event.payload.labels.alertname == "BareMetalHostError"
+        and event.payload.status == "firing"
+      action:
+        run_job_template:
+          name: "jt-ocpv-bmh-error-diag"
+          organization: "OCP-Virt"
+          job_args:
+            extra_vars:
+              correlation_id: "{{ event.payload.fingerprint }}"
+              bmh_name: "{{ event.payload.labels.bmh_name }}"
+              bmh_namespace: "{{ event.payload.labels.namespace }}"
+
+    # ... one rule block per remaining EVT-## row, same shape:
+    # match on labels.alertname, run its Job Template, pass identifying labels as extra_vars
+```
+
+### 3.2 EDA Rulebook — Adhoc (Initiative 3)
+
+```yaml
+---
+- name: OCP Virt Disconnected BM - Adhoc Day-2 Requests
+  hosts: all
+  sources:
+    - ansible.eda.kafka:
+        host: "{{ kafka_bootstrap_host }}"
+        port: "{{ kafka_port }}"
+        topic: "ocpv-adhoc-requests"
+        group_id: "eda-ocpv-baremetal-adhoc"
+        security_protocol: "SASL_SSL"
+        sasl_mechanism: "SCRAM-SHA-512"
+        sasl_username: "{{ kafka_user }}"
+        sasl_password: "{{ kafka_password }}"
+        cafile: "{{ internal_ca_bundle }}"
+
+  rules:
+    - name: ADH-01 VM create
+      condition: >
+        event.payload.request_type == "vm.create"
+        and event.payload.status == "submitted"
+      action:
+        run_job_template:
+          name: "jt-ocpv-vm-create"
+          organization: "OCP-Virt"
+          job_args:
+            extra_vars:
+              correlation_id: "{{ event.payload.request_id }}"
+              requested_by: "{{ event.payload.requested_by }}"
+              vm_name: "{{ event.payload.params.vm_name }}"
+              template_name: "{{ event.payload.params.template_name }}"
+              target_namespace: "{{ event.payload.params.namespace }}"
+
+    # ... one rule block per remaining ADH-## row, same shape:
+    # match on payload.request_type, run its Job Template, pass event.payload.params as extra_vars
+```
+
+### 3.3 Common Playbook Skeleton
+
+Every scenario — event-based or adhoc — wraps its unique logic in this shape. §5 only shows the highlighted task block per scenario; everything else below is boilerplate you write once and reuse.
+
+```yaml
+---
+- name: "<scenario> - common execution skeleton"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    kafka_result_topic: "ocpv-ansible-results"
+    # Kafka writes below assume a Strimzi Kafka Bridge / REST Proxy HTTP endpoint,
+    # since that avoids baking a Python Kafka client into the EE. Swap for a
+    # custom module if you have one.
+
+  tasks:
+    - name: Publish IN_PROGRESS to Kafka result topic
+      ansible.builtin.uri:
+        url: "{{ kafka_bridge_url }}/topics/{{ kafka_result_topic }}"
+        method: POST
+        headers: {Content-Type: "application/vnd.kafka.json.v2+json"}
+        body_format: json
+        body:
+          records:
+            - value:
+                correlation_id: "{{ correlation_id }}"
+                scenario_id: "<EVT-## | ADH-##>"
+                status: "IN_PROGRESS"
+                started_at: "{{ ansible_date_time.iso8601 }}"
+                aap_job_id: "{{ tower_job_id | default(awx_job_id) | default('') }}"
+
+    - block:
+        - name: Idempotency / pre-check guard
+          # e.g. "does the target already exist / already match desired state?"
+          # skip the main block if so, publish SKIPPED_IDEMPOTENT instead of SUCCESS
+
+        # ============================================================
+        # === SCENARIO-SPECIFIC TASK BLOCK — this is what §5 shows ===
+        # ============================================================
+
+        - name: Post-validation - confirm desired end state reached
+          ansible.builtin.assert:
+            that: "<end-state condition>"
+
+      rescue:
+        - name: Capture failure context
+          ansible.builtin.set_fact:
+            failure_reason: "{{ ansible_failed_result.msg | default('unknown') }}"
+
+        - name: Publish FAILED result to Kafka
+          ansible.builtin.uri:
+            url: "{{ kafka_bridge_url }}/topics/{{ kafka_result_topic }}"
+            method: POST
+            headers: {Content-Type: "application/vnd.kafka.json.v2+json"}
+            body_format: json
+            body:
+              records:
+                - value:
+                    correlation_id: "{{ correlation_id }}"
+                    status: "FAILED"
+                    summary: "{{ failure_reason }}"
+                    completed_at: "{{ ansible_date_time.iso8601 }}"
+
+        - name: Fail the play so AAP marks the job failed
+          ansible.builtin.fail:
+            msg: "{{ failure_reason }}"
+
+      always:
+        - name: Publish SUCCESS result to Kafka (only reached if rescue didn't fire)
+          ansible.builtin.uri:
+            url: "{{ kafka_bridge_url }}/topics/{{ kafka_result_topic }}"
+            method: POST
+            headers: {Content-Type: "application/vnd.kafka.json.v2+json"}
+            body_format: json
+            body:
+              records:
+                - value:
+                    correlation_id: "{{ correlation_id }}"
+                    status: "SUCCESS"
+                    summary: "<one-line outcome>"
+                    completed_at: "{{ ansible_date_time.iso8601 }}"
+          when: ansible_failed_task is not defined
+```
+
+---
+
+## 4. Kafka Result-Topic Schema
+
+One shape, used by every playbook, so downstream consumers (dashboards, ITSM, the portal) parse a single contract:
+
+```json
+{
+  "correlation_id": "alert fingerprint (event-based) or portal request_id (adhoc)",
+  "initiative": "event_based | adhoc",
+  "scenario_id": "e.g. EVT-13 or ADH-23",
+  "job_template": "string",
+  "aap_job_id": 12345,
+  "target": {
+    "cluster": "string",
+    "namespace": "string",
+    "resource_kind": "VirtualMachine | BareMetalHost | Node | ...",
+    "resource_name": "string"
+  },
+  "status": "IN_PROGRESS | SUCCESS | FAILED | SKIPPED_IDEMPOTENT",
+  "started_at": "ISO8601",
+  "completed_at": "ISO8601",
+  "summary": "one-line outcome",
+  "details": { "...task-specific key/values..." },
+  "requested_by": "portal user (adhoc only)",
+  "artifacts": ["optional: must-gather URL, log bundle URL, report URL"]
+}
+```
+
+Never put secrets (e.g. a reset password) in this payload — see §5.12 for the pattern.
+
+---
+
+## 5. Worked Pseudocode (15 Representative Scenarios)
+
+Each block below is the **scenario-specific task block** that slots into §3.3. Module names are illustrative pseudocode — validate against what's actually in your EE.
+
+### 5.1 EVT-01 — Post-upgrade validation suite
+
+```yaml
+- name: Gather ClusterOperator status
+  kubernetes.core.k8s_info:
+    api_version: config.openshift.io/v1
+    kind: ClusterOperator
+  register: cluster_operators
+
+- name: Assert no ClusterOperator is Degraded / all Available
+  ansible.builtin.assert:
+    that:
+      - (item.status.conditions | selectattr('type','equalto','Degraded') | map(attribute='status') | first) == "False"
+      - (item.status.conditions | selectattr('type','equalto','Available') | map(attribute='status') | first) == "True"
+    fail_msg: "ClusterOperator {{ item.metadata.name }} unhealthy post-upgrade"
+  loop: "{{ cluster_operators.resources }}"
+  loop_control: {label: "{{ item.metadata.name }}"}
+
+- name: Confirm all nodes Ready
+  kubernetes.core.k8s_info: {kind: Node}
+  register: nodes
+- ansible.builtin.assert:
+    that: "item.status.conditions | selectattr('type','equalto','Ready') | map(attribute='status') | first == 'True'"
+  loop: "{{ nodes.resources }}"
+
+- name: Check HyperConverged CR health
+  kubernetes.core.k8s_info:
+    api_version: hco.kubevirt.io/v1beta1
+    kind: HyperConverged
+    name: kubevirt-hyperconverged
+    namespace: openshift-cnv
+  register: hco
+- ansible.builtin.assert: {that: "hco.resources[0].status.conditions | ... all healthy"}
+
+- name: Test image pull against local mirror registry
+  kubernetes.core.k8s:
+    state: present
+    definition: "<throwaway Pod pulling a known local-mirror image>"
+  register: pull_test
+- name: Clean up pull-test pod
+  kubernetes.core.k8s: {state: absent, definition: "{{ pull_test }}"}
+
+- name: Boot smoke-test one VM per StorageClass
+  loop: "{{ storage_classes_to_test }}"
+  block:
+    - kubevirt.core.kubevirt_vm: {state: present, name: "smoketest-{{ item }}", ...}
+    - name: Wait for Running
+      kubernetes.core.k8s_info: {api_version: kubevirt.io/v1, kind: VirtualMachineInstance, name: "smoketest-{{ item }}"}
+      register: vmi
+      until: vmi.resources[0].status.phase == 'Running'
+      retries: 20
+      delay: 10
+    - kubevirt.core.kubevirt_vm: {state: absent, name: "smoketest-{{ item }}"}
+
+- name: Live-migration re-test on a canary VM
+  kubernetes.core.k8s:
+    definition: {apiVersion: kubevirt.io/v1, kind: VirtualMachineInstanceMigration, spec: {vmiName: "{{ canary_vm }}"}}
+  register: migration
+- name: Wait for migration Succeeded
+  kubernetes.core.k8s_info: {api_version: kubevirt.io/v1, kind: VirtualMachineInstanceMigration, name: "{{ migration.result.metadata.name }}"}
+  until: migration_status.resources[0].status.phase == 'Succeeded'
+  retries: 20
+  delay: 15
+```
+
+### 5.2 EVT-06 — BareMetalHost Error → diagnostics + ticket
+
+```yaml
+- name: Fetch BareMetalHost object
+  kubernetes.core.k8s_info:
+    api_version: metal3.io/v1alpha1
+    kind: BareMetalHost
+    name: "{{ bmh_name }}"
+    namespace: "{{ bmh_namespace }}"
+  register: bmh
+
+- name: Pull Redfish system info + event log
+  community.general.redfish_info:
+    category: Systems
+    command: GetLogs,GetSystemInfo
+    baseuri: "{{ bmh.resources[0].spec.bmc.address | redfish_host_from_bmc_uri }}"
+    username: "{{ bmc_creds.username }}"
+    password: "{{ bmc_creds.password }}"
+  register: redfish_diag
+  no_log: true
+
+- name: Pull Ironic conductor state for this host
+  ansible.builtin.uri:
+    url: "{{ ironic_api }}/v1/nodes/{{ bmh.resources[0].status.provisioning.ID }}/states"
+  register: ironic_state
+
+- name: Bundle diagnostics
+  ansible.builtin.copy:
+    content: "{{ {'redfish': redfish_diag, 'ironic': ironic_state.json} | to_nice_json }}"
+    dest: "/tmp/bmh-{{ bmh_name }}-diag.json"
+
+- name: Open ticket in ITSM
+  ansible.builtin.uri:
+    url: "{{ itsm_api }}/incidents"
+    method: POST
+    body_format: json
+    body:
+      title: "BMH {{ bmh_name }} entered Error state"
+      description: "{{ bmh.resources[0].status.errorMessage }}"
+  register: ticket
+
+- name: Attach diagnostics bundle to ticket
+  ansible.builtin.uri:
+    url: "{{ itsm_api }}/incidents/{{ ticket.json.id }}/attachments"
+    method: POST
+    src: "/tmp/bmh-{{ bmh_name }}-diag.json"
+```
+
+### 5.3 EVT-13 — VMI live migration failed → retry once, then escalate
+
+```yaml
+- name: Look up retry count for this correlation_id (ConfigMap-backed counter)
+  kubernetes.core.k8s_info:
+    kind: ConfigMap
+    name: "migration-retry-{{ correlation_id }}"
+    namespace: eda-state
+  register: retry_state
+  ignore_errors: true   # not found = first failure
+
+- name: Set retry_count fact
+  ansible.builtin.set_fact:
+    retry_count: "{{ retry_state.resources[0].data.count | default(0) | int }}"
+
+- block:
+    - name: Retry live migration
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: kubevirt.io/v1
+          kind: VirtualMachineInstanceMigration
+          metadata: {name: "{{ migration_name }}-retry", namespace: "{{ namespace }}"}
+          spec: {vmiName: "{{ vmi_name }}"}
+
+    - name: Wait for retry outcome
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstanceMigration
+        name: "{{ migration_name }}-retry"
+      register: retry_result
+      until: retry_result.resources[0].status.phase in ['Succeeded', 'Failed']
+      retries: 30
+      delay: 10
+
+    - name: Record that a retry was attempted
+      kubernetes.core.k8s:
+        definition: {kind: ConfigMap, metadata: {name: "migration-retry-{{ correlation_id }}", namespace: eda-state}, data: {count: "1"}}
+  when: retry_count | int == 0
+
+- name: Escalate — retry also failed, or this was already a retry
+  when: (retry_count | int > 0) or (retry_result.resources[0].status.phase == 'Failed')
+  block:
+    - name: Collect VMI + node diagnostics
+      kubernetes.core.k8s_info: {api_version: kubevirt.io/v1, kind: VirtualMachineInstance, name: "{{ vmi_name }}"}
+      register: vmi_diag
+    - name: Page on-call / open high-priority ticket
+      ansible.builtin.uri:
+        url: "{{ itsm_api }}/incidents"
+        method: POST
+        body_format: json
+        body: {title: "Live migration failed twice for {{ vmi_name }}", priority: "high", details: "{{ vmi_diag.resources[0].status }}"}
+```
+
+### 5.4 EVT-15 — ODF/LVMS auto-expand complete → validate capacity
+
+```yaml
+- name: Get StorageCluster / LVMCluster status
+  kubernetes.core.k8s_info:
+    api_version: "{{ storage_backend_api_version }}"   # ocs.openshift.io/v1 or lvm.topolvm.io/v1alpha1
+    kind: "{{ storage_backend_kind }}"
+    namespace: openshift-storage
+  register: storage_status
+
+- name: Confirm expansion reached expected capacity
+  ansible.builtin.assert:
+    that: "storage_status.resources[0].status.capacity | int >= expected_capacity | int"
+
+- name: Re-baseline write/read throughput
+  kubernetes.core.k8s:
+    definition: "<fio benchmark Job against a scratch PVC>"
+  register: fio_job
+- name: Wait for benchmark completion, capture results
+  kubernetes.core.k8s_info: {kind: Job, name: "{{ fio_job.result.metadata.name }}"}
+  register: fio_result
+  until: fio_result.resources[0].status.succeeded == 1
+  retries: 30
+  delay: 10
+
+- name: Compare against last known baseline
+  ansible.builtin.assert:
+    that: "fio_result_throughput >= (last_baseline_throughput * 0.9)"
+    fail_msg: "Storage throughput regressed >10% after expansion"
+
+- name: Update capacity dashboard / CMDB record
+  ansible.builtin.uri: {url: "{{ cmdb_api }}/storage/{{ cluster }}", method: PATCH, body_format: json, body: {capacity: "{{ expected_capacity }}"}}
+```
+
+### 5.5 EVT-19 — NNCP applied → connectivity/throughput validation
+
+```yaml
+- name: Confirm NNCP reports Available
+  kubernetes.core.k8s_info:
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationPolicy
+    name: "{{ nncp_name }}"
+  register: nncp
+- ansible.builtin.assert:
+    that: "(nncp.resources[0].status.conditions | selectattr('type','equalto','Available') | map(attribute='status') | first) == 'True'"
+
+- name: Confirm NodeNetworkState reflects desired config per targeted node
+  kubernetes.core.k8s_info:
+    api_version: nmstate.io/v1
+    kind: NodeNetworkState
+    name: "{{ item }}"
+  loop: "{{ targeted_nodes }}"
+  register: nns_check
+
+- name: Connectivity check between affected nodes/VLANs
+  ansible.builtin.command: "ping -c 3 {{ item.1 }}"
+  delegate_to: "{{ item.0 }}"
+  loop: "{{ targeted_nodes | product(peer_ips) | list }}"
+  register: connectivity
+
+- name: Auto-rollback NNCP if any node regressed
+  kubernetes.core.k8s:
+    state: absent
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationPolicy
+    name: "{{ nncp_name }}"
+  when: connectivity.results | selectattr('rc', 'ne', 0) | list | length > 0
+```
+
+### 5.6 EVT-22 — oc-mirror sync complete → CatalogSource health check
+
+```yaml
+- name: Confirm mirror sync Job succeeded
+  kubernetes.core.k8s_info:
+    kind: Job
+    name: "{{ mirror_sync_job }}"
+    namespace: openshift-marketplace
+  register: sync_job
+- ansible.builtin.assert: {that: "sync_job.resources[0].status.succeeded == 1"}
+
+- name: Force CatalogSource re-poll
+  kubernetes.core.k8s:
+    kind: CatalogSource
+    name: "{{ catalog_name }}"
+    namespace: openshift-marketplace
+    state: patched
+    definition: {metadata: {annotations: {"eda.ocpv/refresh": "{{ ansible_date_time.iso8601 }}"}}}
+
+- name: Wait for CatalogSource READY
+  kubernetes.core.k8s_info: {kind: CatalogSource, name: "{{ catalog_name }}", namespace: openshift-marketplace}
+  register: cs
+  until: cs.resources[0].status.connectionState.lastObservedState == 'READY'
+  retries: 20
+  delay: 15
+
+- name: Enumerate newly available operator updates
+  kubernetes.core.k8s_info: {kind: PackageManifest, namespace: openshift-marketplace}
+  register: packages
+
+- name: Notify platform team of pending updates
+  ansible.builtin.uri: {url: "{{ chatops_webhook }}", method: POST, body_format: json, body: {text: "{{ packages.resources | length }} operator updates now available"}}
+```
+
+### 5.7 ADH-01 — Create VM from template/golden image
+
+```yaml
+# extra_vars from portal: vm_name, template_name, target_namespace, storage_class,
+#                          network_name, requested_by, ticket_id
+
+- name: Idempotency check — does VM already exist?
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    name: "{{ vm_name }}"
+    namespace: "{{ target_namespace }}"
+  register: existing_vm
+
+- name: Create VM from template (golden image sourced from local mirror only)
+  when: existing_vm.resources | length == 0
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: kubevirt.io/v1
+      kind: VirtualMachine
+      metadata: {name: "{{ vm_name }}", namespace: "{{ target_namespace }}"}
+      spec: "<templated from {{ template_name }}, storage_class, network_name>"
+
+- name: Wait for VM Running
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    name: "{{ vm_name }}"
+    namespace: "{{ target_namespace }}"
+  register: vmi
+  until: vmi.resources[0].status.phase == 'Running'
+  retries: 30
+  delay: 10
+
+- name: Apply default NetworkPolicy + CMDB labels
+  kubernetes.core.k8s:
+    definition: {metadata: {labels: {"backup-policy": "{{ requested_backup_tier | default('standard') }}", "managed-by": "eda-ocpv"}}}
+
+- name: Register in CMDB / monitoring
+  ansible.builtin.uri: {url: "{{ cmdb_api }}/vms", method: POST, body_format: json, body: {name: "{{ vm_name }}", namespace: "{{ target_namespace }}", owner: "{{ requested_by }}"}}
+```
+
+### 5.8 ADH-08 — On-demand snapshot create/restore
+
+```yaml
+# extra_vars: action (create|restore), vm_name, snapshot_name, namespace
+
+- name: Create VirtualMachineSnapshot
+  when: action == 'create'
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: snapshot.kubevirt.io/v1beta1
+      kind: VirtualMachineSnapshot
+      metadata: {name: "{{ snapshot_name }}", namespace: "{{ namespace }}"}
+      spec: {source: {apiGroup: kubevirt.io, kind: VirtualMachine, name: "{{ vm_name }}"}}
+
+- name: Wait for snapshot ReadyToUse
+  when: action == 'create'
+  kubernetes.core.k8s_info: {api_version: snapshot.kubevirt.io/v1beta1, kind: VirtualMachineSnapshot, name: "{{ snapshot_name }}", namespace: "{{ namespace }}"}
+  register: snap
+  until: snap.resources[0].status.readyToUse
+  retries: 20
+  delay: 15
+
+- name: Restore from snapshot
+  when: action == 'restore'
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: snapshot.kubevirt.io/v1beta1
+      kind: VirtualMachineRestore
+      metadata: {name: "{{ snapshot_name }}-restore", namespace: "{{ namespace }}"}
+      spec:
+        target: {apiGroup: kubevirt.io, kind: VirtualMachine, name: "{{ vm_name }}"}
+        virtualMachineSnapshotName: "{{ snapshot_name }}"
+
+- name: Wait for restore complete
+  when: action == 'restore'
+  kubernetes.core.k8s_info: {api_version: snapshot.kubevirt.io/v1beta1, kind: VirtualMachineRestore, name: "{{ snapshot_name }}-restore", namespace: "{{ namespace }}"}
+  register: restore
+  until: restore.resources[0].status.complete
+  retries: 20
+  delay: 15
+```
+
+### 5.9 ADH-12 — Expand VM disk/PVC
+
+```yaml
+# extra_vars: vm_name, namespace, disk_pvc_name, new_size, vm_guest_ip
+
+- name: Confirm StorageClass supports online expansion
+  kubernetes.core.k8s_info: {kind: StorageClass, name: "{{ storage_class }}"}
+  register: sc
+- ansible.builtin.assert: {that: "sc.resources[0].allowVolumeExpansion == true"}
+
+- name: Patch PVC to new size
+  kubernetes.core.k8s:
+    kind: PersistentVolumeClaim
+    name: "{{ disk_pvc_name }}"
+    namespace: "{{ namespace }}"
+    state: patched
+    definition: {spec: {resources: {requests: {storage: "{{ new_size }}"}}}}
+
+- name: Wait for PVC resize to complete
+  kubernetes.core.k8s_info: {kind: PersistentVolumeClaim, name: "{{ disk_pvc_name }}", namespace: "{{ namespace }}"}
+  register: pvc
+  until: pvc.resources[0].status.capacity.storage == new_size
+  retries: 20
+  delay: 10
+
+- name: Trigger in-guest filesystem grow
+  ansible.builtin.command: "growpart /dev/vda 1 && xfs_growfs /"
+  delegate_to: "{{ vm_guest_ip }}"
+
+- name: Validate in-guest free space reflects new size
+  ansible.builtin.command: "df -h /"
+  delegate_to: "{{ vm_guest_ip }}"
+  register: df_check
+```
+
+### 5.10 ADH-19 — Request static IP (NNCP)
+
+```yaml
+# extra_vars: node_name, nic_name, vlan, requested_ip, prefix, requested_by
+
+- name: Validate IP not already allocated
+  ansible.builtin.uri: {url: "{{ ipam_api }}/check/{{ requested_ip }}"}
+  register: ipam_check
+- ansible.builtin.fail:
+    msg: "{{ requested_ip }} already in use"
+  when: ipam_check.json.in_use
+
+- name: Apply NodeNetworkConfigurationPolicy with static IP
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: nmstate.io/v1
+      kind: NodeNetworkConfigurationPolicy
+      metadata: {name: "static-ip-{{ node_name }}-{{ vlan }}"}
+      spec:
+        nodeSelector: {kubernetes.io/hostname: "{{ node_name }}"}
+        desiredState:
+          interfaces:
+            - name: "{{ nic_name }}.{{ vlan }}"
+              type: vlan
+              ipv4: {enabled: true, address: [{ip: "{{ requested_ip }}", prefix-length: "{{ prefix }}"}]}
+
+- name: Wait for policy Available
+  kubernetes.core.k8s_info: {api_version: nmstate.io/v1, kind: NodeNetworkConfigurationPolicy, name: "static-ip-{{ node_name }}-{{ vlan }}"}
+  register: nncp
+  until: (nncp.resources[0].status.conditions | selectattr('type','equalto','Available') | map(attribute='status') | first) == 'True'
+  retries: 20
+  delay: 10
+
+- name: Reserve IP in IPAM
+  ansible.builtin.uri: {url: "{{ ipam_api }}/reserve", method: POST, body_format: json, body: {ip: "{{ requested_ip }}", owner: "{{ requested_by }}"}}
+
+- name: Connectivity test to new IP
+  ansible.builtin.command: "ping -c 3 {{ requested_ip }}"
+```
+
+### 5.11 ADH-23 — Cordon / drain / uncordon for planned maintenance
+
+```yaml
+# extra_vars: node_name, action (cordon|drain|uncordon), requested_by, maintenance_window_id
+
+- name: Pre-drain live-migration readiness check
+  when: action == 'drain'
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    field_selectors: ["status.nodeName={{ node_name }}"]
+  register: vmis_on_node
+
+- name: Confirm each VMI is migratable
+  when: action == 'drain'
+  ansible.builtin.assert:
+    that: "(item.status.conditions | selectattr('type','equalto','LiveMigratable') | map(attribute='status') | first) == 'True'"
+    fail_msg: "VMI {{ item.metadata.name }} is not live-migratable — abort drain"
+  loop: "{{ vmis_on_node.resources }}"
+
+- name: Create NodeMaintenance CR (drives live-migration of all VMs off node)
+  when: action == 'drain'
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: nodemaintenance.kubevirt.io/v1beta1
+      kind: NodeMaintenance
+      metadata: {name: "{{ node_name }}-maint"}
+      spec: {nodeName: "{{ node_name }}", reason: "{{ maintenance_window_id }}"}
+
+- name: Cordon node only (no VM movement)
+  when: action == 'cordon'
+  kubernetes.core.k8s:
+    definition: {apiVersion: v1, kind: Node, metadata: {name: "{{ node_name }}"}, spec: {unschedulable: true}}
+
+- name: Uncordon node + remove NodeMaintenance CR
+  when: action == 'uncordon'
+  block:
+    - kubernetes.core.k8s: {state: absent, api_version: nodemaintenance.kubevirt.io/v1beta1, kind: NodeMaintenance, name: "{{ node_name }}-maint"}
+    - kubernetes.core.k8s: {definition: {apiVersion: v1, kind: Node, metadata: {name: "{{ node_name }}"}, spec: {unschedulable: false}}}
+    - name: Post-maintenance VM rebalance check
+      # reuses the EVT-08 pattern
+```
+
+### 5.12 ADH-29 — Reset VM console/admin password
+
+```yaml
+# extra_vars: vm_name, namespace, requested_by, ticket_id
+
+- name: Generate one-time password
+  ansible.builtin.set_fact:
+    otp: "{{ lookup('ansible.builtin.password', '/dev/null length=20 chars=ascii_letters,digits') }}"
+  no_log: true
+
+- name: Inject via cloud-init userData patch, then restart VM to apply
+  kubernetes.core.k8s:
+    kind: VirtualMachine
+    name: "{{ vm_name }}"
+    namespace: "{{ namespace }}"
+    state: patched
+    definition: "<patch spec.template.spec.volumes[cloudInitNoCloud].userData with {{ otp }}>"
+  no_log: true
+
+- name: Restart VM to apply cloud-init change
+  kubernetes.core.k8s: {state: absent, api_version: kubevirt.io/v1, kind: VirtualMachineInstance, name: "{{ vm_name }}", namespace: "{{ namespace }}"}
+  # KubeVirt recreates the VMI automatically since the VM is set to run
+
+- name: Deliver password out-of-band — NOT via Kafka result topic
+  ansible.builtin.uri:
+    url: "{{ itsm_api }}/incidents/{{ ticket_id }}/secure-note"
+    method: POST
+    body_format: json
+    body: {note: "{{ otp }}"}
+  no_log: true
+
+# Kafka result publishes status only: {status: SUCCESS, action: "password_reset",
+#   vm_name, delivered_via: "itsm_secure_note"} — never the secret itself
+```
+
+### 5.13 ADH-34 — In-guest OS patch via SSH/virtctl
+
+```yaml
+# extra_vars: vm_name, namespace, patch_group (security-only|full), requested_by, maintenance_window
+
+- name: Resolve guest IP, add to in-memory inventory
+  kubernetes.core.k8s_info: {api_version: kubevirt.io/v1, kind: VirtualMachineInstance, name: "{{ vm_name }}", namespace: "{{ namespace }}"}
+  register: vmi
+- ansible.builtin.add_host: {name: "{{ vmi.resources[0].status.interfaces[0].ipAddress }}", groups: patch_targets}
+
+- name: Pre-patch snapshot (safety net)
+  # reuses the ADH-08 create-snapshot task block
+
+- name: Point guest package manager at local disconnected repo
+  ansible.builtin.template: {src: local-mirror.repo.j2, dest: /etc/yum.repos.d/local-mirror.repo}
+  delegate_to: "{{ vmi.resources[0].status.interfaces[0].ipAddress }}"
+
+- name: Apply patches
+  ansible.builtin.dnf: {name: '*', state: latest, security: "{{ patch_group == 'security-only' }}"}
+  delegate_to: "{{ vmi.resources[0].status.interfaces[0].ipAddress }}"
+  register: patch_result
+
+- name: Reboot if kernel updated, wait for guest agent back
+  ansible.builtin.reboot: {}
+  delegate_to: "{{ vmi.resources[0].status.interfaces[0].ipAddress }}"
+  when: "'kernel' in (patch_result.results | map(attribute='name') | list | join(','))"
+
+- name: Post-patch health check
+  ansible.builtin.command: "systemctl is-system-running"
+  delegate_to: "{{ vmi.resources[0].status.interfaces[0].ipAddress }}"
+```
+
+### 5.14 ADH-37 — must-gather / sosreport bundle
+
+```yaml
+# extra_vars: target_type (vm|node), target_name, ticket_id, requested_by
+
+- name: Collect node sosreport
+  when: target_type == 'node'
+  ansible.builtin.command: "sos report --batch"
+  delegate_to: "{{ target_name }}"
+
+- name: Collect VM in-guest sosreport via SSH
+  when: target_type == 'vm'
+  ansible.builtin.command: "sos report --batch"
+  delegate_to: "{{ vm_guest_ip }}"
+
+- name: Collect namespace-scoped must-gather (KubeVirt-focused, local mirror image)
+  ansible.builtin.command: >
+    oc adm must-gather --image={{ local_mirror_registry }}/kubevirt-must-gather
+    -- /usr/bin/gather --vm={{ target_name | default('') }}
+  register: must_gather
+
+- name: Upload bundle to internal artifact store (no external upload — disconnected)
+  ansible.builtin.uri: {url: "{{ internal_artifact_store }}/upload", method: POST, src: "{{ must_gather.bundle_path }}"}
+  register: upload
+
+- name: Attach link to ticket
+  ansible.builtin.uri: {url: "{{ itsm_api }}/incidents/{{ ticket_id }}/attachments", method: POST, body_format: json, body: {url: "{{ upload.json.url }}"}}
+```
+
+### 5.15 ADH-42 — On-demand mirror registry re-sync
+
+```yaml
+# extra_vars: image_filter (optional), requested_by
+
+- name: Render one-off imageset-config
+  ansible.builtin.template: {src: imageset-config.yaml.j2, dest: /tmp/imageset-config.yaml}
+
+- name: Run oc-mirror against local mirror registry
+  ansible.builtin.command: "oc-mirror --config=/tmp/imageset-config.yaml docker://{{ local_mirror_registry }}"
+  register: mirror_run
+
+- name: Apply generated ICSP/IDMS + CatalogSource manifests
+  kubernetes.core.k8s: {src: "{{ mirror_run.generated_manifests_dir }}"}
+
+- name: Validate pull-through of a sample synced image
+  kubernetes.core.k8s:
+    definition: "<throwaway Pod pulling one newly-synced image>"
+  register: pull_validate
+
+- name: Notify platform team of newly synced content
+  ansible.builtin.uri: {url: "{{ chatops_webhook }}", method: POST, body_format: json, body: {text: "Registry re-sync complete, requested by {{ requested_by }}"}}
+```
+
+---
+
+## 6. Extending This Pattern
+
+- **New event-based scenario**: add/confirm a PrometheusRule (or bridge a K8s state change into one) → add a rule block to the §3.1 rulebook matching its `alertname` → create `jt-ocpv-<subsystem>-<action>` → wrap the task in the §3.3 skeleton → add a row to §2.1.
+- **New adhoc scenario**: have the portal emit a `request_type` → add a rule block to §3.2 → create the Job Template → wrap the task in the skeleton → add a row to §2.2.
+- Keep `correlation_id` flowing end-to-end (alert fingerprint or portal `request_id`) — it's what lets the Kafka result-topic record join back to the originating alert/request.
+- Keep the `jt-ocpv-<subsystem>-<action>` naming convention consistent — it keeps AAP RBAC/scoping simple as the catalog grows past 69 scenarios.
