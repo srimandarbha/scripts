@@ -1,0 +1,318 @@
+# Agentic SRE Day‑2 Reference: LangGraph + pgvector on OpenShift Virtualization (PowerMax + Pure)
+
+Below is a complete use-case catalog plus the reference architecture, reusable graph patterns, pgvector schema, tool matrix, and disconnected-environment deployment model. Everything assumes **self-managed pgvector (no ODAP/OpenShift AI dependency, no external vector DB, no external LLM APIs)**.
+
+---
+
+## 1. Reference Architecture (disconnected)
+
+```
+                    ┌────────────────────────────────────────────────┐
+ Alertmanager ─────►│  SRE Agent Gateway (FastAPI, in-cluster)        │
+ Webhook / Chat     │  LangGraph Supervisor (router)                 │
+                    └───────┬────────────────────────────────────────┘
+                            │  handoffs to specialist subagents
+   ┌────────────┬───────────┼────────────┬────────────┬──────────────┐
+   │ RCA agent  │ Storage   │ MTV/       │ GitOps/    │ Network/OVN  │
+   │ (AIOps)    │ agent     │ Migration  │ Upgrade    │ agent        │
+   │            │ (PMX/Pure)│ agent      │ agent      │              │
+   └─────┬──────┴─────┬─────┴─────┬──────┴──────┬─────┴──────┬───────┘
+         │            │           │             │            │
+   Tools layer (least-privilege ServiceAccounts, short-lived Vault tokens):
+   kubectl/k8s-python · PowerMax Unisphere REST · Pure FA REST 2.x · MTV/Forklift CRs
+   ovnkube-trace (exec) · Prometheus API · Loki API · ArgoCD API · Vault API · Velero/OADP
+         │
+   ┌─────┴───────────────────────────────┐    ┌───────────────────────────┐
+   │ PostgreSQL (CNPG/PGO, HA)           │    │ LLM runtime (GPU pool)    │
+   │  - pgvector collections (knowledge) │    │ vLLM: Llama-3.3-70B /     │
+   │  - LangGraph PostgresSaver          │    │  Qwen2.5-72B-Instruct     │
+   │    (state, resume, HITL)            │    │ TEI: bge-m3 embeddings +  │
+   └─────────────────────────────────────┘    │  bge-reranker (RAG)       │
+                                              └───────────────────────────┘
+```
+
+**Key design decisions**
+
+| Concern | Choice |
+|---|---|
+| Orchestration | LangGraph `StateGraph` with cycles (plan→act→observe→reflect), `interrupt()` for human approval, `PostgresSaver` checkpointer so long runs (warm migrations, upgrades) survive restarts and can be resumed |
+| "Pure agentic" | Routing, tool selection, remediation choice are LLM-decided — no static runbook DSL. Guardrails are allowlists + HITL gates, not hardcoded logic |
+| Memory | pgvector over runbooks, postmortems, alert fingerprints, log error signatures, migration failure modes, capacity profiles |
+| Secrets | HashiCorp Vault: K8s auth for agents, AppRole for tools, dynamic creds for Postgres, **rotation of CSI driver array credentials** |
+| Deployment | Own namespace, ArgoCD-managed, default-deny egress NetworkPolicies (fully air-gapped) |
+
+---
+
+## 2. Reusable LangGraph skeleton (all use cases inherit this)
+
+```python
+from typing import TypedDict
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.types import interrupt, Command
+
+class SREState(TypedDict):
+    signal: dict            # alert / ticket / cron / chat event
+    context: dict           # retrieved similar incidents (pgvector)
+    hypotheses: list
+    evidence: list
+    plan: dict
+    approval: dict          # resume payload from HITL
+    actions: list
+    outcome: dict
+
+g = StateGraph(SREState)
+g.add_node("retrieve_similar", search_pgvector)   # semantic memory
+g.add_node("plan", llm_planner)                   # agentic planning
+g.add_node("act", tool_executor)                  # probes/changes
+g.add_node("observe", llm_reflect)                # score hypotheses
+g.add_node("propose", propose_change_with_diff)   # dry-run + diff
+g.add_node("gate", hitl_gate)                     # interrupt() here
+g.add_node("execute", execute_change)
+g.add_node("verify", verify_resolution)
+g.add_node("learn", embed_postmortem)             # write back to pgvector
+
+g.set_entry_point("retrieve_similar")
+g.add_edge("retrieve_similar", "plan")
+g.add_edge("plan", "act")
+g.add_edge("act", "observe")
+g.add_conditional_edges("observe", needs_more_evidence,
+                        {"plan": "plan", "ok": "propose"})
+g.add_edge("propose", "gate")
+g.add_conditional_edges("gate", approved, {"execute": "execute", END: END})
+g.add_edge("execute", "verify")
+g.add_conditional_edges("verify", resolved, {"learn": "learn", "plan": "plan"})
+g.add_edge("learn", END)
+
+graph = g.compile(checkpointer=PostgresSaver(conn))
+```
+
+Multi-agent variant: a **Supervisor router** with handoffs to specialists (`storage-pmx`, `storage-pure`, `virt`, `net-ovn`, `mtv`, `gitops`, `security`) — each specialist is its own subgraph with a scoped tool allowlist and its own ServiceAccount.
+
+---
+
+## 3. Use-Case Catalog
+
+### A. Incident Detection, Triage & RCA (AIOps)
+
+**UC‑01 — Alert triage & correlation agent**
+- Ingest: Alertmanager webhook (OCP alerts + array alerts pulled from PowerMax `/performance` health + Pure port/host health).
+- Dedupe alert storms by embedding normalized alert labels (alert + labels + annotations) into pgvector and clustering with cosine similarity (< 0.1 distance ⇒ same storm).
+- Enrich: `promql` queries, K8s events, VM (VMI) state, then LLM classifies severity/blast radius, attaches `runbook_uri` retrieved from pgvector.
+- Output: one consolidated incident card to chat/ServiceNow, or escalation.
+
+**UC‑02 — Root-cause analysis agent (cross-layer, flagship)**
+- Loop: hypothesis → parallel probes → reflect → refine. Probes span four layers:
+  1. **Compute/virt**: VMI status, `virt-launcher` pod, node pressure, live-migration state.
+  2. **OVN**: `ovnkube-trace` between endpoints, NetworkPolicy eval, egress IP, MTU (Geneve overhead).
+  3. **Storage path**: PVC → `PV.spec.csi.volumeHandle` → **PowerMax**: parse `symmID.volumeID`, query Unisphere `/sloprovisioning` + `/performance` (director/port/volume latency, SRDF state); **Pure**: query volume `metrics-history`, host connectivity, QoS limits.
+  4. **Node I/O stack**: node_exporter disk metrics vs array-side latency ⇒ isolates *host/path vs array*.
+- Confidence-scored root cause + proposed fix; HITL gate; execute; verify; auto-postmortem into pgvector.
+
+```python
+# Probe mapping: PVC → array volume (tool implementations)
+def pvc_to_powermax(pvc):
+    pv = k8s.get_pv(pvc.spec.volumeName)
+    symm, vol = pv.spec.csi.volumeHandle.split(".")   # "0001979..00123"
+    return pmx.get_volume_metrics(symm, vol)          # Unisphere REST
+
+def pvc_to_pure(pvc):
+    pv = k8s.get_pv(pvc.spec.volumeName)
+    return pure.get_volume_metrics(pv.spec.csi.volumeHandle)  # FA REST 2.x
+```
+
+**UC‑03 — Alert-to-known-issue matcher**
+- New alert fires → embed error text/context → pgvector top-k over past incidents + KB → if similarity > threshold with a previously *resolved* incident, propose the previous fix as first action (with a diff preview), else fall through to RCA.
+- This is where Day‑2 MTTR drops fastest: the system literally learns your environment.
+
+**UC‑04 — Log error-signature clustering agent (Loki)**
+- Continuous job: sample error lines from `virt-launcher`, CDI importer pods, `ovnkube-*`, CSI driver pods, `forklift-controller`; normalize (strip UUIDs/IPs/WWNs); embed; cluster in pgvector.
+- New unknown signature ⇒ automatic "emerging failure mode" ticket with affected workloads list.
+
+### B. Storage Day‑2 (Dell PowerMax + Pure)
+
+**UC‑05 — Volume capacity forecasting & auto-grow**
+- Trend kubelet volume stats + array-side utilization (PowerMax storage group / SRP headroom; Pure volume capacity) → LLM forecast with seasonality reasoning → pgvector match against **capacity profiles** of similar workloads (workload fingerprint embedding) for analogous growth curves.
+- Propose: online PVC resize (PowerMax/Pure CSI support `allowVolumeExpansion`), or SG volume expansion; HITL; execute; verify expansion at array layer.
+
+**UC‑06 — Latency triangulation agent (per-volume SLO)**
+- Symptom "VM I/O slow": compares (a) app/FS latency, (b) node `node_exporter` device latency, (c) PowerMax front-end director port + volume metrics, (d) Pure QoS setting/metrics.
+- Decision tree is LLM-driven but evidence-based: array-side latency high ⇒ array tier/QoS action; array fine + host high ⇒ host/path (queue depth, multipath); both fine + VM high ⇒ virtio-blk/scsi controller config, PVC on wrong storage class.
+- Remedies: set/change PowerMax SG QoS or move volume to different SG/Service Level; set Pure volume QoS limit; live-migrate VM to different node.
+
+**UC‑07 — Multipath / initiator / path health agent**
+- PowerMax: verify initiator logins across front-end directors (port groups, masking views) from OCP nodes' HBAs; detect single-path volumes; correlate `multipath -ll` from privileged DaemonSet tool.
+- Pure: check host connectivity (FC/iSCSI/NVMe-FC/NVMe-TCP), fix host IQNs/WWNs, detect asymmetric paths.
+- Output: precise zoning/fabric ticket text (agents write better tickets than humans at 3am) or auto-fix host entry.
+
+**UC‑08 — Snapshot & replication compliance auditor**
+- Walk PowerMax SnapVX policies + SRDF session state and Pure protection groups / ActiveDR pod links; compare against policy-as-code in Git; classify gaps (missed snap, link degraded, journal/consistency issues); remediate or file drift.
+- Embeds each finding so recurring replication drift on the same entity is detected as a pattern, not a surprise.
+
+**UC‑09 — Ransomware / anomaly snapshot agent**
+- Detect abnormal rate-of-change / entropy on Pure volumes and PowerMax storage groups (deviation from the volume's own behavior fingerprint in pgvector) → **immediately create immutable snapshot** (Pure SafeMode / SnapVX linked + immutable) → isolate suspect VMs (NetworkPolicy + pause) → HITL for further action.
+
+**UC‑10 — Array tech-refresh / cross-array volume migration agent**
+- Plans and executes moves of VMs/PVCs between PowerMax ↔ Pure (e.g., decommission, tier rebalance): uses CDI DataVolume clones / VM live-migration to new PV / Velero-restore, orders and **throttles** the wave to avoid an I/O storm on shared front-end ports, verifies checksums + app health, decommissions old volumes **only after HITL**.
+
+**UC‑11 — Storage leak/garbage collector**
+- Reconcile array volume inventory (both arrays) against K8s PV/PVC objects: find array volumes with no owner (orphaned from deleted PVCs, failed MTV imports, old test volumes) → cost/leak report → approval-gated delete. Also flags PVs with `Released` state stuck in the CSI driver.
+
+### C. VMware → OpenShift Virtualization (MTV) Day‑2
+
+**UC‑12 — Pre-migration assessment agent (wave planner)**
+- Inventory vCenter: VMs, disks (incl. RDM/independent disks), snapshots, NICs/port groups, boot type (BIOS/UEFI), CPU flags.
+- Autonomous mapping decisions: port group → **OVN secondary network / NAD (bridge to VLAN)**; datastore → **storage class** (PowerMax vs Pure, chosen by SLA/QoS/pgvector-matched workload class); right-size CPU/memory from actual vCenter usage stats (embed workload profile → match to similar already-migrated workloads' final sizing).
+- Emits `MigrationPlan` CRs / mapping ConfigMaps as **a Git PR** (ArgoCD applies); blocks incompatible VMs with explanations (the LLM writes the explanation against known MTV/virt-v2v constraints retrieved from pgvector's **migration failure-mode library**).
+
+**UC‑13 — Migration execution & stall-breaker agent (flagship)**
+- Watches `Migration` CRs, CDI importer pods, conversion (virt-v2v) pods via K8s events + Loki.
+- Warm migration loop: monitors per-iteration delta; detects stalls (no progress in N min) → probes importer logs → classifies failure against embedded known errors → decides retry / adjust (e.g., storage class change, bandwidth limit, restart importer) → rollback decision on repeated failure.
+- Because LangGraph checkpointer persists state, a multi-hour warm migration wave survives agent restarts and shift changes — resumable with full context.
+
+**UC‑14 — Post-migration validation agent**
+- Verifies: IP/MAC preserved in OVN (query VMI interfaces), guest reachability (probes), app-level checks, boot time, **I/O performance vs VMware baseline** (same volume workload before/after — Prometheus history). Regression ⇒ feed UC‑06 triangulation and propose fixes (QoS on the new array side, scheduler affinity, queue depth in guest).
+
+**UC‑15 — Source decommission gatekeeper**
+- Only after UC‑14 passes: proposes powering off the vSphere VM → 7-day observation → delete after HITL. Never deletes from a failed/uncertain validation. Every decision + evidence chain logged into pgvector as migration knowledge for the next wave.
+
+### D. Cluster, GitOps & Disconnected-Environment Day‑2
+
+**UC‑16 — OpenShift upgrade orchestrator**
+- Pre-flight: operator compatibility matrix (CNV/OpenShift Virtualization, MTV, LVM operator, **PowerMax CSI, Pure CSI driver versions** vs target OCP), PDB checks, VM eviction strategy (`LiveMigrate`) verification, ArgoCD app health/sync.
+- Executes node-pool-by-pool: drains nodes while **coordinating VM live migrations** (waits for `VirtualMachineInstanceMigration` completion per node), watches MCO state, canary workload tests post-pool, ArgoCD re-sync validation. Rollback recommendation is LLM-evaluated from evidence.
+
+**UC‑17 — Disconnected content mirror agent**
+- Watches curated release bundles (OCP, CNV, MTV, CSI drivers, vLLM models!) → runs `oc mirror`/`skopeo` copy jobs into the internal registry → updates Git (digest-pinned manifests) → ArgoCD PR → applies upgrade CRs. pgvector holds past *version-conflict breakage signatures* so the agent refuses combos that previously failed (e.g., CNV X + CSI Y issue).
+
+**UC‑18 — ArgoCD drift classifier & remediator**
+- Pulls `argocd app diff` for all apps; LLM classifies each drift: *manual hotfix during incident* vs *error* vs *abusive change* vs *expected external mutation* (CSI driver mutating objects, for example).
+- Errors/abuse ⇒ auto-revert to Git state; legitimate hotfixes ⇒ **PR the change back to Git** with an explanation and link to the incident (this turns undocumented hotfixes into documented ones — a huge Day‑2 hygiene win).
+
+**UC‑19 — Certificate & secret lifecycle agent**
+- Scans: cert-manager certificates, ingress/router certs, internal PKI, **Vault's own TLS**, kubelet serving certs. Plans and executes rotations.
+- Rotates **CSI driver array credentials in Vault (KV v2)** and updates the referencing K8s Secrets + driver pods with zero downtime. Summarizes Vault audit logs weekly (LLM) for anomalous secret access.
+
+**UC‑20 — Etcd / control-plane health sentinel**
+- Analyses etcd metrics + pod logs; escalates with specific remediation (defragment schedule proposal, snapshot verify via backup agent), cross-checking last known-good procedures from pgvector runbooks.
+
+### E. OVN Networking Day‑2
+
+**UC‑21 — Connectivity triage agent ("VM can't reach X")**
+- Runs `ovnkube-trace` (src: VM pod, dst: target), evaluates NetworkPolicies affecting both endpoints, checks NAD attachment for OVN secondary networks (typical migration mapping target), egress IPs, shared Gateway/EGW routing, MTU mismatch (VM with jumbo frames on Geneve overlay), conntrack table pressure on the node.
+- Loops hypothesis→trace until the drop point is found; suggests exact fix (policy patch, MTU change, NAD fix) as a Git PR.
+
+**UC‑22 — NetworkPolicy audit agent**
+- Detects overly permissive policies (empty podSelector + `0.0.0.0/0`), shadowed rules, and orphaned policies for migrated workload namespaces; proposes least-privilege policy PRs; embeds policy semantic hashes to track policy-drift over time.
+
+### F. Backup / DR / Security / Compliance
+
+**UC‑23 — Backup verification agent (OADP/Velero + snapshots)**
+- Periodically restores selected VMs/backups into a **scratch namespace**: boots VM, runs app-level probes, verifies PowerMax SnapVX / Pure snapshot consistency groups referenced by the backup. Vectorizes results; a backup that "succeeded" but restores broken is the #1 silent Day‑2 failure — this agent catches it.
+
+**UC‑24 — DR runbook execution agent (game-day + real failover)**
+- Executes SRDF/ActiveDR failover procedures: checks replication consistency, executes failover (HITL hard-gate for real events; auto for drills), validates DNS/routes/services/VM boot order, produces pass/fail report. Every drill's outcome is embedded so the procedure *adapts* to what actually worked in your environment.
+
+**UC‑25 — Compliance remediation agent**
+- Ingests Compliance Operator results; explains each CIS/DISA violation in context; generates remediation PRs (e.g., kubelet flags, SCC tightening) via GitOps; tracks exceptions with expiry dates.
+
+**UC‑26 — Vault hygiene agent**
+- Detects static/duplicated secrets, unused dynamic creds, missing TTLs, audit-log anomalies (LLM pattern reasoning over Vault audit entries); proposes migrations to dynamic secrets (e.g., Postgres creds for the agent platform itself).
+
+### G. Capacity, Cost & Knowledge Ops
+
+**UC‑27 — VM right-sizing agent**
+- Compares vCenter historical usage → OCP actual usage post-migration → proposes `VirtualMachine` resource edits (now blocking edits don't require VM restart for hot-pluggable resources); uses pgvector workload analogs ("similar fingerprint workloads settled at 4 vCPU/12Gi").
+
+**UC‑28 — Thin-provision risk agent**
+- PowerMax SRP/storage group headroom + over-subscription ratio; Pure array capacity + volume snapshot overhead; predicts "out of physical capacity" events and proposes rebalancing via UC‑10.
+
+**UC‑29 — Postmortem & knowledge capture agent**
+- On incident close: assembles timeline from Alertmanager, Loki, and **the LangGraph checkpointer itself** (the executed tool-call trace is the best evidence log you'll ever have) → writes postmortem → embeds into pgvector → instantly improves UC‑01/02/03.
+
+**UC‑30 — Shift-handoff summarizer**
+- Reads all *running/paused* graph states (pending approvals, in-flight migrations, unverified remediations) → produces a handoff brief; incoming engineer can literally resume any paused graph via CLI: `srectl resume <thread_id> --approve`.
+
+---
+
+## 4. pgvector design (single Postgres, three roles: knowledge + LangGraph checkpoint + audit)
+
+```sql
+CREATE EXTENSION vector;
+
+CREATE TABLE runbooks (
+  id uuid PRIMARY KEY, domain text, severity text,
+  content text, embedding vector(1024)   -- bge-m3
+);
+CREATE TABLE incidents (
+  id uuid, ts timestamptz, title text, root_cause text,
+  resolution text, tags text[],
+  embedding vector(1024)
+);
+CREATE TABLE alert_fingerprints (   -- dedupe/storm clustering
+  alert_hash text PRIMARY KEY, labels jsonb,
+  first_seen timestamptz, occurrence bigint,
+  embedding vector(1024)
+);
+CREATE TABLE error_signatures (source text, signature text, embedding vector(1024));
+CREATE TABLE migration_knowledge (phase text, outcome text, embedding vector(1024));
+CREATE TABLE capacity_profiles (workload_desc text, final_sizing jsonb, embedding vector(1024));
+
+CREATE INDEX ON incidents USING hnsw (embedding vector_cosine_ops);
+-- LangGraph checkpointer creates its own tables (checkpoints, writes)
+-- plus an agent_audit table: every tool call, args, result-hash, approver, ts
+```
+
+Retrieval pattern: `bge-m3` embed → pgvector top-k (HNSW, cosine) → `bge-reranker-v2-m3` rerank → context into graph state.
+
+---
+
+## 5. Tool matrix (per specialist agent)
+
+| Specialist | Tools | Auth/RBAC |
+|---|---|---|
+| storage-pmx | Unisphere REST 9.x: `/sloprovisioning` (SGs, volumes, initiators, masking views), `/replication` (SRDF, SnapVX), `/performance` | Vault AppRole; read-default, write-gated |
+| storage-pure | FlashArray REST 2.x: `/volumes`, `/hosts`, `/ports`, `/protection-groups`, `/pods`, `metrics-history`, SafeMode | Vault AppRole |
+| virt | k8s API: `VirtualMachine`, `VMI`, `VirtualMachineInstanceMigration`, CDI DataVolumes, `virtctl` exec | SA scoped to app namespaces |
+| mtv | Forklift CRDs: Providers, `MigrationPlan`, `Migration`, inventory API, vCenter API (read) | SA + Vault vCenter creds |
+| net-ovn | exec `ovnkube-trace`, `ovn-nbctl show` (via privileged tool pod), NetworkPolicy CRUD → Git PR | read-only SA + Git write via ArgoCD |
+| gitops | ArgoCD API (app list, diff, sync), Gitea/Git PR API | Vault-stored ArgoCD token |
+| security | Vault API (KV v2, dynamic, audit), Compliance Operator CRs, cert-manager CRs | scoped Vault policy |
+| observ | Prometheus API, Loki API, Alertmanager API | read-only |
+
+**Common tool contract:** every mutating tool takes `dry_run=True` and returns a unified diff; the graph's HITL node always renders the diff; every execution writes to `agent_audit`.
+
+---
+
+## 6. Disconnected-environment specifics
+
+- **LLM runtime**: vLLM (OpenAI-compatible) on a dedicated GPU node pool; Llama‑3.3‑70B / Qwen2.5‑72B for reasoning + tool calling; small router model (8B) for cheap handoffs. Model weights are mirrored into the internal registry like any other artifact (UC‑17 covers their lifecycle too).
+- **Embeddings/rerank**: TEI pods serving `bge-m3` + `bge-reranker-v2-m3` — no external embedding APIs.
+- **Postgres**: CloudNativePG/PGO operator, 3 replicas, pgvector compiled or image-baked; same cluster hosts checkpointer + knowledge + audit.
+- **Images**: everything mirrored (`oc mirror`/skopeo); LangGraph/vLLM/TEI images pinned by digest in Git, applied by ArgoCD.
+- **Egress**: default-deny `NetworkPolicy`; the only "external" reachability is intra-cluster endpoints (Unisphere, Pure Mgmt VIP, vCenter, Vault, Git, registry).
+- **HITL channels**: on-prem Mattermost/RocketChat/ServiceNow webhook, or the break-glass CLI resume (`interrupt()` + `Command(resume=...)`).
+- **Vault**: air-gapped instance, `pki` for mTLS between agent pods and tool gateway, `transit` for encrypting pgvector content at rest if needed.
+
+---
+
+## 7. Guardrails (non-negotiable for "pure agentic" in prod)
+
+1. **Risk classes**: read-only tools = autonomous; mutating with reversible effect = one HITL gate; destructive/blast-radius > 1 namespace (array volume deletes, SRDF failover, VM deletes) = **hard gate + typed confirmation + two-person option**.
+2. **Budgeted autonomy**: max N tool calls / T minutes per graph run (circuit breaker against LLM loops).
+3. **Blast-radius tagging**: every action carries `entity`, `scope`, `rollback_ref`; rollback tools are first-class graph nodes.
+4. **Eval harness**: replay recorded incidents (from the checkpointer) nightly; track tool-call success rate, MTTR delta, false-positive remediation rate; gate agent version bumps on eval results — agents get GitOps-managed versioning like everything else.
+5. **Audit**: the Postgres audit table is the compliance artifact — every action traceable to alert → retrieval → reasoning → approval → diff → result.
+
+---
+
+### Suggested rollout order
+
+1. UC‑01 + UC‑03 (triage + known-issue matching) — read-only, immediate value, builds the pgvector corpus.
+2. UC‑02 RCA agent — read-only probes across all four layers; proves cross-domain value.
+3. UC‑05/06/07 storage agents with HITL — PowerMax/Pure teams see value first.
+4. UC‑12–15 MTV agents — you're mid-migration program, this compounds learnings per wave.
+5. UC‑16–18 upgrades/GitOps/mirror agents — full autonomy for the disconnected lifecycle.
+6. UC‑24 drills and everything else as trust accumulates.
+
+If you want, I can go one level deeper on any single use case — e.g., the full LangGraph implementation of UC‑13 (MTV stall-breaker) or UC‑02 (RCA) with the actual tool functions for PowerMax/Pure REST and the OVN probe pod design.
