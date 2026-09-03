@@ -1,0 +1,249 @@
+# Agentic SRE Day‑2 Operations on OpenShift — LangGraph + pgvector
+
+Below is a complete reference: architecture, the universal agent skeleton, a full use‑case catalog (~70 use cases across 12 domains), deep dives, schema/tooling, safety/guardrails, disconnected‑env specifics, and evaluation strategy.
+
+---
+
+## 1. Reference Architecture
+
+```
+ Alertmanager │ Loki │ K8s API watch │ GitOps (Argo) │ Vault │ Storage array APIs │ OVN
+        │
+        ▼  (webhooks / Kafka event bus)
+┌────────────────────────────────────────────────────────────┐
+│  SRE Agent Platform (OpenShift Deployment, restricted SCC) │
+│                                                            │
+│  LangGraph Supervisor (StateGraph, hierarchical)           │
+│   ├── Triage subgraph        ├── Diagnose loop subgraph    │
+│   ├── Plan subgraph (RAG)    ├── Approval gate (interrupt) │
+│   ├── Execute subgraph       ├── Verify subgraph           │
+│   └── Learn subgraph (writeback)                           │
+│   PostgresSaver checkpointer (durable, resumable, replay)  │
+└────────────────────────────────────────────────────────────┘
+     │                  │                    │
+     ▼                  ▼                    ▼
+ pgvector store     Tool mesh (HTTP/gRPC)   LLM + embedder
+ (runbooks,         read tools (Python)     (vLLM + TEI on-prem
+ postmortems,       write tools (Go gateway  GPU nodes — air-gap
+ logs, alerts,      + OPA allowlist,         friendly)
+ CVEs, policies)    dry-run enforced)
+```
+
+**Why LangGraph:** cyclic state machines (diagnose loops), durable execution via PostgreSQL checkpointer (survive pod restarts mid‑incident), first‑class human‑in‑the‑loop `interrupt()`, subgraph composition per domain, and time‑travel replay for auditing agent decisions.
+
+**Why pgvector:** one Postgres instance serves three roles — (1) vector knowledge base (RAG over runbooks/postmortems/KBs), (2) semantic memory (incident similarity, episodic memory), (3) LangGraph checkpoint store. Hybrid search (SQL filters + vector + full‑text RRF) with HNSW indexes gives sub‑50ms retrieval at millions of chunks.
+
+---
+
+## 2. The Universal Agent Skeleton (all use cases instantiate this)
+
+Every use case below is the same graph shape — **Perceive → Retrieve → Reason (loop) → Plan → Approve → Execute → Verify → Learn**:
+
+```python
+from typing import TypedDict, Annotated
+import operator
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.postgres import PostgresSaver
+
+class SREState(TypedDict):
+    alert: dict                      # event/alert/trigger payload
+    similar: list[dict]              # pgvector retrieval results
+    hypothesis: str
+    findings: Annotated[list, operator.add]   # accumulates tool evidence
+    rca: str
+    plan: list[dict]                 # remediation steps w/ risk + rollback
+    approval: str
+    execution_log: list[dict]
+    verified: bool
+    escalated: bool
+
+def perceive(state): ...             # normalize alert, map CI/component
+def retrieve(state): ...             # pgvector: similar incidents + runbooks
+def diagnose(state): ...             # LLM proposes hypothesis, calls read-tools, loops
+def plan_remediation(state): ...     # RAG runbook -> concrete steps + rollback
+def approve(state):
+    if risk(state) > THRESHOLD:      # interrupt() pauses graph, persists state
+        decision = interrupt({"plan": state["plan"], "risk": risk(state)})
+    else:
+        decision = "auto"
+    return {"approval": decision}
+def execute(state): ...              # dry-run first, then real via Go gateway
+def verify(state): ...               # check SLIs/SLOs returned to normal
+def learn(state): ...                # embed outcome back into pgvector
+
+g = StateGraph(SREState)
+g.add_node("perceive", perceive); g.add_node("retrieve", retrieve)
+g.add_node("diagnose", diagnose); g.add_node("plan", plan_remediation)
+g.add_node("approve", approve); g.add_node("execute", execute)
+g.add_node("verify", verify); g.add_node("learn", learn)
+
+g.add_edge(START, "perceive"); g.add_edge("perceive", "retrieve")
+g.add_edge("retrieve", "diagnose")
+g.add_conditional_edges("diagnose", lambda s: "hypothesis_confirmed" if s["rca"] else "iterate",
+                        {"hypothesis_confirmed": "plan", "iterate": "diagnose"})
+g.add_edge("plan", "approve")
+g.add_conditional_edges("approve", lambda s: s["approval"],
+                        {"auto": "execute", "approved": "execute", "denied": END})
+g.add_edge("execute", "verify")
+g.add_conditional_edges("verify", lambda s: "ok" if s["verified"] else "rollback",
+                        {"ok": "learn", "rollback": "execute"})   # bounded retries
+g.add_edge("learn", END)
+
+graph = g.compile(checkpointer=PostgresSaver.from_conn_string(PG_DSN))
+```
+
+**Autonomy levels (applied per use case):**
+
+| Level | Behavior |
+|---|---|
+| **L0** | Read‑only diagnosis; posts RCA/suggestion to Slack/ticket |
+| **L1** | Auto‑executes low‑risk actions (pod restart, PVC resize) with rollback |
+| **L2** | `interrupt()` approval gate (node drain, VM migration, cert rotation) |
+| **L3** | Change‑window + CAB approval (cluster upgrades, OVN changes) |
+
+---
+
+## 3. Full Use‑Case Catalog
+
+### Domain 1 — Incident Detection & Triage
+
+| UC | Agent does | LangGraph pattern | pgvector role | Level |
+|---|---|---|---|---|
+| **UC‑01** Alert correlation/dedup | Clusters alert firehose into incidents via semantic similarity of alert text + shared topology | Streaming graph; batch embedding of alerts | HNSW index over alert embeddings; cosine clustering | L0 |
+| **UC‑02** Alert enrichment & routing | Adds CI mapping, ownership, severity, "similar to INC‑2841 (94%)" | Linear chain | Retrieve top‑k similar historical alerts with metadata filters (cluster, component) | L0 |
+| **UC‑03** Automated RCA | Multi‑hop causal walk: eviction → node pressure → kubelet → cert expiry. Runs `oc` read tools until hypothesis confirmed | Cyclic diagnose loop | Retrieves similar postmortems each iteration to bias hypotheses | L0/L1 |
+| **UC‑04** Self‑healing remediation | Executes plan (restart deployment, clear evicted pods, `virtctl migrate`) with dry‑run → verify → rollback | Plan‑and‑execute + interrupt | Finds runbook + past successful remediations for this failure signature | L1/L2 |
+| **UC‑05** Known‑issue lookup | Matches symptoms to KCS/KB/bugzilla entries (internal mirror in disconnected env) | RAG chain | KB chunks embedded per OCP version; version filter applied | L0 |
+| **UC‑06** On‑call copilot | Interactive: "why are pods pending on node‑x?" → runs diagnostics, explains, proposes commands | ReAct loop with interrupt for write ops | Conversation memory + episodic incident memory | L2 |
+| **UC‑07** Escalation orchestrator | Decides severity/paging from blast radius (topology graph) + similar past incidents | Chain + rules hybrid | Severity prediction from embedded incident histories | L0 |
+| **UC‑08** Timeline reconstruction | Merges K8s events, audit logs, alerts, deploys into causal timeline | Map‑reduce subgraph | Time‑windowed semantic grouping of log/event chunks | L0 |
+
+### Domain 2 — Post‑Incident Learning
+
+| UC | Agent does | LangGraph pattern | pgvector role | Level |
+|---|---|---|---|---|
+| **UC‑09** Postmortem generator | Drafts 5‑whys postmortem from timeline; dedupes against prior docs | Chain + critique loop | Writes embedding; checks near‑duplicate postmortems | L0 |
+| **UC‑10** Runbook mining | Distills SOPs from tickets/Slack/postmortems into structured runbooks | Extract → validate → write | Source retrieval + output embedding | L0 |
+| **UC‑11** Self‑improvement | Distills newly‑validated remediation sequences into a new LangGraph tool or runbook step | Meta‑graph (writes tools as code artifacts) | Experience memory: "what worked" embeddings | L0 |
+| **UC‑12** Shift handover report | Summarizes 24h incidents, actions, open threads | Map‑reduce | Retrieves ongoing threads' full state from checkpointer | L0 |
+
+### Domain 3 — Change & Upgrade Management
+
+| UC | Agent does | LangGraph pattern | pgvector role | Level |
+|---|---|---|---|---|
+| **UC‑13** OCP upgrade orchestrator | Pre‑checks (health, operator compat, PV drivers), mirrors payload (disconnected), drives CVO upgrade, watches `ClusterOperator` conditions, **auto‑aborts + rolls back pools on degradation** | Long‑running durable graph (hours) — survives restarts via checkpointer | Retrieves past upgrade failures by version transition | L3 |
+| **UC‑14** Disconnected payload validation | Verifies all release images exist in internal registry, digest + signature match before upgrade attempt | Chain with verification subgraph | Release‑digest KB | L0 |
+| **UC‑15** Operator/OLM ordering + catalog rebuild | Resolves upgrade dependency ordering; rebuilds/prunes catalogs via `opm`; verifies digest pinning | DAG executor with retry | Prior catalog‑sync failure retrieval | L3 |
+| **UC‑16** Node pool rolling | MCO pool strategy: cordon → drain → **live‑migrate VMs first** → wait → reboot → health gate → next node | Hierarchical subgraph per node | Past node‑roll failures for this MachineConfig | L2/L3 |
+| **UC‑17** KubeVirt compat pre‑check | Validates VMI feature gates, CPU model, storage/live‑migration compat against target OCP‑V version | Checklist chain | Compatibility matrix RAG | L0 |
+| **UC‑18** Drift detection → GitOps auto‑PR | Diffs live state vs ArgoCD desired; generates fix PR with rationale | Loop over drifted resources | Policy/repo‑history retrieval for PR context | L2 |
+| **UC‑19** Cert & secret rotation | Detects expiring certs (ingress, service CA, node, Vault PKI); rotates, propagates, restarts consumers | Schedule‑triggered graph + interrupt | Prior rotation postmortems | L2 |
+| **UC‑20** Maintenance window planner | Proposes windows from error budget + workload calendars; files CAB | Planner chain | Historical change‑failure windows | L0 |
+
+### Domain 4 — Backup / DR / Resilience
+
+| UC | Agent does | LangGraph pattern | pgvector role | Level |
+|---|---|---|---|---|
+| **UC‑21** etcd backup verification | Runs `etcdctl snapshot restore` into scratch cluster, verifies API health + data sanity; alerts on silent corruption | Scheduled graph with verification loop | Baseline "healthy restore" signatures | L1 |
+| **UC‑22** VM backup validation | OADP restore‑test of sampled VMs (boot, service check), records RTO | Per‑VM subgraph | Past restore failures per backup method | L1 |
+| **UC‑23** DR game‑day orchestrator | Executes full failover runbook, measures RTO/RPO, generates gaps report | Long‑running durable graph | DR exercise history comparison | L3 |
+| **UC‑24** Quorum/HA drills | Injects control‑plane node loss in staging, verifies etcd quorum recovery | Experiment graph | Prior drill learnings | L3 |
+| **UC‑25** Post‑restore consistency | Semantic diff of pre/post‑restore state (configmaps, CRDs, PVCs) | Diff + reasoning loop | Known post‑restore anomalies | L0 |
+
+### Domain 5 — Capacity & Performance
+
+| UC | Agent does | LangGraph pattern | pgvector role | Level |
+|---|---|---|---|---|
+| **UC‑26** Capacity forecasting | Predicts node/PVC/IPAM/GPU exhaustion dates; opens proactive tickets | Forecast chain + report | Embeds capacity incidents for regime comparison | L0 |
+| **UC‑27** Right‑sizing | Recommends VMI requests/limits + OCP‑V overcommit ratios from usage percentiles | Analysis loop | Similar workload profiles for recommendation sanity | L0 |
+| **UC‑28** Regression hunter | Pre/post‑upgrade benchmark comparison; flags regressions with causal candidates | Diff + RCA loop | Prior regression signatures | L0 |
+| **UC‑29** Noisy‑neighbor hunter | Correlates slow VM disk latency with co‑located VMs; suggests live‑migration targets | Diagnose loop | Storage latency incident history | L1 |
+| **UC‑30** HPA tuner | Proposes HPA/VPA/behavior tuning from SLO burn + traffic patterns | Optimization loop | Embeds tuning outcomes as experience | L0 |
+
+### Domain 6 — Node / Compute Day‑2
+
+| UC | Agent does | LangGraph pattern | pgvector role | Level |
+|---|---|---|---|---|
+| **UC‑31** Node NotReady auto‑diag | Distinguishes kubelet cert, kernel panic, NIC flap, OOM; applies targeted fix | Classic diagnose loop | NotReady incident embeddings by cause | L1 |
+| **UC‑32** Node pressure mitigation | Disk pressure cleanup (logs, images `crictl prune`), evictions analysis | Chain + verify | Past cleanup efficacy | L1 |
+| **UC‑33** MCO pool degradation triage | Diagnoses stuck `Updated=False`, MachineConfig conflicts | Diagnose loop | MCO failure KB | L2 |
+| **UC‑34** Node recycle | Safe replacement: drain, migrate VMs, delete Node/VM, wait for provisioning | Hierarchical with health gates | Past recycle failures | L2 |
+
+### Domain 7 — OpenShift Virtualization (KubeVirt) Day‑2
+
+| UC | Agent does | LangGraph pattern | pgvector role | Level |
+|---|---|---|---|---|
+| **UC‑35** VM boot failure diagnosis | Walks CDI import → virt‑launcher → storage latency → guest‑agent; identifies exact failure layer | Multi‑layer diagnose loop | KubeVirt error‑message embeddings | L0/L1 |
+| **UC‑36** Live‑migration orchestration | Picks targets (CPU compat, anti‑affinity), migrates, watches `VirtualMachineInstanceMigration`, auto‑recovers failed migrations | Planner + executor + verify | Past migration failures by cause | L2 |
+| **UC‑37** Guest OS patching | Orchestrates VM template rollout + qemu‑guest‑agent driven in‑guest actions, canary VMs first | Rolling graph with canary gate | Patch‑failure history per template | L3 |
+| **UC‑38** VM snapshot/clone lifecycle | Validates online‑snapshot consistency, prunes orphaned snapshots/boilerplates | Scheduled + verify | Snapshot incident history | L1 |
+| **UC‑39** GPU/device plugin health | Diagnoses device plugin/virt‑launcher device passthrough failures | Diagnose loop | Device error KB | L0 |
+| **UC‑40** VM consolidation | Bin‑packs VMIs for host power/efficiency via migrations | Optimizer + executor | Consolidation risk profile from history | L2 |
+
+### Domain 8 — Storage Day‑2 (ODF / Arrays)
+
+| UC | Agent does | LangGraph pattern | pgvector role | Level |
+|---|---|---|---|---|
+| **UC‑41** Pending PVC diagnosis | Checks SC topology, quota, CSI provisioner, array capacity, WWN/multipath | Diagnose loop | PVC‑pending incident embeddings | L0/L1 |
+| **UC‑42** Path failover triage | Array multipath/ALUA path loss: verifies, remediates, validates I/O | Diagnose + fix + verify | Array event history | L2 |
+| **UC‑43** Snapshot/orphan cleanup | Identifies unused snapshots, stale PVCs (unattached, old), proposes reclaim with owner confirmation | Analysis + approval | Data‑reclaim near‑miss history (safety bias) | L2 |
+| **UC‑44** Storage forecast | Predicts pool/PVC quota exhaustion; auto‑resizes within policy | Forecast + act | Capacity growth regimes | L1 |
+| **UC‑45** CSI plugin triage | `csi-cephfsplugin`/`rbdplugin` pod failures, node plugin restarts | Diagnose loop | CSI error KB | L1 |
+| **UC‑46** Ceph health escalation | PG degraded/peering triage with escalation guidance; safe‑mode recommendations | Diagnose + recommend | Ceph incident history | L0 |
+
+### Domain 9 — Network / OVN Day‑2
+
+| UC | Agent does | LangGraph pattern | pgvector role | Level |
+|---|---|---|---|---|
+| **UC‑47** IPAM exhaustion planner | Detects subnet/EgressIP pool exhaustion before pod‑creation failures; plans subnet expansion | Forecast + plan | Past IP exhaustion incidents | L2 |
+| **UC‑48** NetworkPolicy conflict detection | Simulates policy interactions; detects deny‑shadowing/connectivity loss; proposes fix | Simulation + reasoning | Policy‑conflict KB | L0 |
+| **UC‑49** North‑south traffic triage | MTU mismatch, router pod issues, egress firewall; uses `ovs-ofctl`/OVN NB/SB dumps | Multi‑layer diagnose loop | Network failure embeddings | L0 |
+| **UC‑50** OVN control‑plane health | `ovnkube-*` crashloops, NB/SB DB sync lag, ovs daemon health | Diagnose loop | OVN error KB | L1/L2 |
+| **UC‑51** DNS resolution triage | CoreDNS config, node local DNS, ndots issues | Diagnose loop | DNS incident embeddings | L0 |
+| **UC‑52** Ingress/LB health | Router sharding saturation, HAProxy health, LB service sync | Diagnose loop | Ingress incident history | L1 |
+
+### Domain 10 — Security & Compliance
+
+| UC | Agent does | LangGraph pattern | pgvector role | Level |
+|---|---|---|---|---|
+| **UC‑53** CVE triage & prioritization | Maps CVEs to running images (ACS/Trivy DB), checks exploitability, exposure, proposes patch order | Scoring chain | CVE KB; similar CVE handling history | L0 |
+| **UC‑54** Disconnected CVE sync | Ingests offline CVE feeds (data diode/USB pipeline), diff‑impacts cluster | Ingest + analysis | Feed history embeddings | L0 |
+| **UC‑55** Image mirroring & signature verify | Mirrors images, verifies digests/signatures, updates ImageContentSourcePolicy/tags | Verify‑heavy chain | Digest/policy KB | L1 |
+| **UC‑56** Compliance (CIS/NIST/STIG) | Scans, matches violated controls to policy text, generates remediation PRs (SCC/PSS/config) | Scan → RAG → PR | Control text embeddings for matching | L2 |
+| **UC‑57** Secrets hygiene | Finds static secrets in manifests; migrates to Vault dynamic secrets/KV; wires injection | Analysis + migration graph | Vault‑migration runbooks | L2 |
+| **UC‑58** Audit‑log anomaly detection | Detects suspicious event sequences (recon → privesc patterns) | Sequence reasoning | Baseline benign‑sequence embeddings (novelty detection) | L0 |
+| **UC‑59** RBAC/SCC drift review | Detects privilege creep vs baseline; explains risk | Diff + reasoning | Baseline policy embeddings | L0 |
+
+### Domain 11 — Observability Hygiene
+
+| UC | Agent does | LangGraph pattern | pgvector role | Level |
+|---|---|---|---|---|
+| **UC‑60** Log anomaly detection | Embeds log template clusters; flags semantic novelty vs baseline | Streaming embedder + novelty check | Baseline log‑template embeddings per component | L0 |
+| **UC‑61** Alert rule quality | Mines postmortems for "alert fired too late/never" gaps; proposes rules; dedupes noisy rules | Analysis + proposal | Postmortem + rule embeddings | L0 |
+| **UC‑62** Must‑gather analyzer | Parses bundle, extracts errors, matches known bugs/CVEs, produces triage report | Map‑reduce + RAG | Error‑signature KB | L0 |
+| **UC‑63** Cardinality explosion detection | Detects high‑cardinality metric labels killing Prometheus; proposes relabeling | Analysis chain | Cardinality incident history | L0 |
+
+### Domain 12 — Governance & Meta‑Agents
+
+| UC | Agent does | LangGraph pattern | pgvector role | Level |
+|---|---|---|---|---|
+| **UC‑64** Error‑budget enforcer | Monitors burn rates; proposes deploy freezes / rollback decisions | Policy + recommend | SLO history embeddings | L0/L2 |
+| **UC‑65** Change‑failure correlation | Correlates deployments to SLO regressions with confidence | Causal loop | Deploy + regression embeddings | L0 |
+| **UC‑66** Agent self‑evaluation | Runs golden incident set, compares to expectations before graph/prompt changes ship | Eval harness graph | Golden‑set + eval‑run storage | — |
+| **UC‑67** Time‑travel RCA of agent decisions | Replays LangGraph checkpoint history: "why did the agent drain node‑3?" | Checkpoint replay (built‑in) | — | — |
+| **UC‑68** NOC supervisor | Routes events to domain specialists (network/storage/VM/platform/security agents) | Hierarchical supervisor | Shared context store | per‑child |
+| **UC‑69** Knowledge freshness | Detects runbooks stale vs current OCP/OCP‑V version; flags for rewrite | Version‑diff + RAG | Versioned KB embeddings | L0 |
+| **UC‑70** Cost optimization | Idle PVCs/LBs, VM density, unattached volumes → reclaim proposals | Analysis + approval | Reclaim history | L2 |
+
+---
+
+## 4. Deep Dive #1 — Incident → Resolution (the flagship)
+
+```python
+def retrieve(state: SREState) -> dict:
+    q = f"{state['alert']['name']} {state['alert']['description']} {state['alert']['labels']}"
+    return {"similar": kb.search(
+        embed(q), k=5,
+
+
