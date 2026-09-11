@@ -1,0 +1,448 @@
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from typing import Annotated, Any, Callable, Dict, List, Literal
+from typing_extensions import TypedDict
+
+import openai
+from kubernetes import client, config
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from langgraph.types import RetryPolicy
+from langchain_openai.chat_models.base import OpenAITimeoutError
+
+
+# Suppress urllib3 SSL warnings for local dev
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ==============================================================================
+# 1. ATOMIC & CORRUPTION-RESISTANT FLAT-FILE MEMORY
+# ==============================================================================
+
+MEMORY_FILE = "k8s_docker_desktop_memory.json"
+
+class FlatFileMemory:
+    """Manages persistent JSON flat-file storage for:
+    - Semantic memory: Factual cluster attributes, nodes, constraints.
+    - Episodic memory: Historical log of executed tasks and results.
+    - Procedural memory: Runbooks & Standard Operating Procedures (SOPs).
+    """
+
+    def __init__(self, filepath: str = MEMORY_FILE):
+        self.filepath = filepath
+        self._initialize()
+
+    def _get_default_structure(self) -> Dict[str, Any]:
+        return {
+            "target_cluster": "docker-desktop",
+            "semantic_memory": {
+                "cluster_type": "Docker Desktop Single-Node Kubernetes",
+                "context": "docker-desktop",
+                "destructive_guardrails": "Delete, Evict, Drain, or Scale-to-0 require explicit HITL authorization.",
+            },
+            "episodic_memory": [],
+            "procedural_memory": {
+                "resolve_cluster_incident": [
+                    "1. Verify node readiness and resource pressure.",
+                    "2. Scan pods in default and target namespaces.",
+                    "3. If pod remediation requires recreation, request destructive approval."
+                ]
+            },
+        }
+
+    def _initialize(self):
+        if not os.path.exists(self.filepath):
+            self._save(self._get_default_structure())
+
+    def _load(self) -> dict:
+        if not os.path.exists(self.filepath):
+            return self._get_default_structure()
+
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if not content:
+                    return self._get_default_structure()
+                return json.loads(content)
+        except (json.JSONDecodeError, ValueError) as err:
+            backup_file = f"{self.filepath}.corrupt.{int(datetime.now().timestamp())}.bak"
+            print(f"\nâš ï¸ [Memory Engine] Corrupted JSON detected ({err}). Backing up to {backup_file} and resetting...")
+            try:
+                shutil.copyfile(self.filepath, backup_file)
+            except Exception:
+                pass
+            defaults = self._get_default_structure()
+            self._save(defaults)
+            return defaults
+
+    def _save(self, data: dict):
+        """Atomic write using a temp file to prevent half-written or corrupted files."""
+        dir_name = os.path.dirname(os.path.abspath(self.filepath))
+        with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+            json.dump(data, tf, indent=2)
+            temp_name = tf.name
+
+        os.replace(temp_name, self.filepath)
+
+    def read_all(self) -> dict:
+        return self._load()
+
+    def update_semantic(self, key: str, value: str) -> str:
+        data = self._load()
+        data["semantic_memory"][key] = value
+        self._save(data)
+        return f"Semantic memory key '{key}' updated."
+
+    def record_episode(self, task: str, summary: str, outcome: str) -> str:
+        data = self._load()
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "task": task,
+            "actions_taken": summary,
+            "outcome": outcome,
+        }
+        data["episodic_memory"].append(entry)
+        self._save(data)
+        return "Episode recorded in memory."
+
+    def register_procedure(self, name: str, steps: List[str]) -> str:
+        data = self._load()
+        data["procedural_memory"][name] = steps
+        self._save(data)
+        return f"Procedure '{name}' saved."
+
+memory_store = FlatFileMemory()
+
+# ==============================================================================
+# 2. KUBERNETES CLIENT (Docker Desktop Windows & SSL Hardened)
+# ==============================================================================
+
+try:
+    k8s_conf = client.Configuration()
+    config.load_kube_config(context="docker-desktop", client_configuration=k8s_conf)
+
+    # Bypass Docker Desktop local TLS handshake and cert verification issues on Windows
+    k8s_conf.verify_ssl = False
+    k8s_conf.ssl_ca_cert = None
+    k8s_conf.assert_hostname = False
+    k8s_conf.client_side_validation = False
+
+    api_client = client.ApiClient(configuration=k8s_conf)
+    k8s_core = client.CoreV1Api(api_client=api_client)
+    k8s_apps = client.AppsV1Api(api_client=api_client)
+except Exception as exc:
+    print(f"[Init Warning] K8s client config failed: {exc}")
+    k8s_core = None
+    k8s_apps = None
+
+# ==============================================================================
+# 3. TOOLS: SAFE (AUTONOMOUS) VS DESTRUCTIVE (GUARDED)
+# ==============================================================================
+
+@tool
+def list_pods(namespace: str = "default") -> str:
+    """[SAFE] Lists pods, phases, and restart counts in a namespace on Docker Desktop."""
+    if not k8s_core:
+        return "Error: K8s client not connected to docker-desktop context."
+    try:
+        pods = k8s_core.list_namespaced_pod(namespace=namespace, _request_timeout=5)
+        if not pods.items:
+            return f"No pods found in namespace '{namespace}'."
+        results = [
+            f"Pod: {p.metadata.name} | Phase: {p.status.phase} | Restarts: {sum(c.restart_count for c in p.status.container_statuses or [])}"
+            for p in pods.items
+        ]
+        return "\n".join(results)
+    except Exception as exc:
+        return f"Error querying pods: {exc}"
+
+@tool
+def get_node_health() -> str:
+    """[SAFE] Checks Ready, MemoryPressure, and DiskPressure conditions on Docker Desktop node."""
+    if not k8s_core:
+        return "Error: K8s client not connected to docker-desktop context."
+    try:
+        nodes = k8s_core.list_node(_request_timeout=5)
+        report = []
+        for n in nodes.items:
+            conds = {c.type: c.status for c in n.status.conditions}
+            report.append(
+                f"Node: {n.metadata.name} | Ready: {conds.get('Ready')} | "
+                f"MemoryPressure: {conds.get('MemoryPressure')} | DiskPressure: {conds.get('DiskPressure')}"
+            )
+        return "\n".join(report)
+    except Exception as exc:
+        return f"Error checking node conditions: {exc}"
+
+@tool
+def save_semantic_fact(key: str, value: str) -> str:
+    """[SAFE] Saves verified cluster state or facts into flat-file semantic memory."""
+    return memory_store.update_semantic(key, value)
+
+@tool
+def delete_pod(pod_name: str, namespace: str = "default") -> str:
+    """[DESTRUCTIVE] Deletes a pod to evict or force restart. REQUIRES HUMAN AUTHORIZATION."""
+    if not k8s_core:
+        return "Error: K8s client not connected to docker-desktop context."
+    try:
+        k8s_core.delete_namespaced_pod(name=pod_name, namespace=namespace, _request_timeout=5)
+        return f"DESTRUCTIVE SUCCESS: Pod '{pod_name}' deleted in namespace '{namespace}'."
+    except Exception as exc:
+        return f"Failed to delete pod: {exc}"
+
+SAFE_TOOLS = [list_pods, get_node_health, save_semantic_fact]
+DESTRUCTIVE_TOOLS = [delete_pod]
+ALL_TOOLS = SAFE_TOOLS + DESTRUCTIVE_TOOLS
+DESTRUCTIVE_TOOL_NAMES = {t.name for t in DESTRUCTIVE_TOOLS}
+
+# ==============================================================================
+# 4. LANGGRAPH REACT WORKFLOW WITH HITL GUARDRAIL
+# ==============================================================================
+
+class AgentState(TypedDict):
+    messages: Annotated[List[BaseMessage], add_messages]
+
+# Local LLM listening on 8080 with client-level timeout & retry
+llm = ChatOpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="not-needed",
+    model="local-model",
+    temperature=0.0,
+    timeout=120.0,
+    max_retries=2,
+)
+
+model_with_tools = llm.bind_tools(ALL_TOOLS)
+
+def agent_node(state: AgentState) -> dict:
+    """Autonomous reasoning node."""
+    return {"messages": [model_with_tools.invoke(state["messages"])]}
+
+def route_evaluator(state: AgentState) -> Literal["safe_tools", "destructive_guardrail", "__end__"]:
+    """Decides if the tool call runs autonomously, trips the guardrail, or finishes."""
+    last_message = state["messages"][-1]
+    if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
+        return END
+
+    for call in last_message.tool_calls:
+        if call["name"] in DESTRUCTIVE_TOOL_NAMES:
+            return "destructive_guardrail"
+
+    return "safe_tools"
+
+def destructive_guardrail_node(state: AgentState):
+    """Execution breakpoint node for human authorization."""
+    return state
+
+# Node-level retry policy
+llm_retry_policy = RetryPolicy(
+    max_attempts=3,
+    initial_interval=2.0,
+    backoff_factor=2.0,
+    retry_on=(
+        openai.APITimeoutError,
+        openai.APIConnectionError,
+        openai.InternalServerError,
+        OpenAITimeoutError,
+        TimeoutError,
+    ),
+)
+
+workflow = StateGraph(AgentState)
+workflow.add_node("agent", agent_node, retry=llm_retry_policy)
+workflow.add_node("safe_tools", ToolNode(SAFE_TOOLS))
+workflow.add_node("destructive_guardrail", destructive_guardrail_node)
+workflow.add_node("destructive_tools", ToolNode(DESTRUCTIVE_TOOLS))
+
+workflow.add_edge(START, "agent")
+workflow.add_conditional_edges(
+    "agent",
+    route_evaluator,
+    {
+        "safe_tools": "safe_tools",
+        "destructive_guardrail": "destructive_guardrail",
+        END: END,
+    }
+)
+workflow.add_edge("safe_tools", "agent")
+workflow.add_edge("destructive_guardrail", "destructive_tools")
+workflow.add_edge("destructive_tools", "agent")
+
+# Compile with interrupt boundary right before destructive operations execute
+checkpointer = MemorySaver()
+app = workflow.compile(checkpointer=checkpointer, interrupt_before=["destructive_guardrail"])
+
+# ==============================================================================
+# 5. PRE-FLIGHT CONNECTIVITY CHECKS
+# ==============================================================================
+
+def verify_llm_connectivity(endpoint_url: str = "http://localhost:8080/v1/models", timeout_seconds: int = 2) -> bool:
+    """Verifies local LLM server is up and listening on port 8080."""
+    try:
+        req = urllib.request.Request(endpoint_url, headers={"User-Agent": "HealthCheck/1.0"}, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            return resp.status in (200, 204)
+    except urllib.error.HTTPError as err:
+        return err.code in (401, 403, 404, 405)
+    except Exception:
+        return False
+
+def verify_cluster_connectivity(timeout_seconds: int = 2) -> bool:
+    """Verifies Docker Desktop's Kubernetes API server is online."""
+    if not k8s_core:
+        return False
+    try:
+        k8s_core.get_api_resources(_request_timeout=timeout_seconds)
+        return True
+    except Exception:
+        return False
+
+def retry_check(
+    check_fn: Callable[[], bool],
+    service_name: str,
+    max_attempts: int = 3,
+    initial_backoff: float = 1.0,
+    backoff_factor: float = 2.0,
+) -> bool:
+    """Retries a diagnostic check with exponential backoff."""
+    delay = initial_backoff
+    for attempt in range(1, max_attempts + 1):
+        print(f"ðŸ”„ [{service_name}] Check attempt {attempt} of {max_attempts}...")
+        if check_fn():
+            print(f"âœ… [{service_name}] Online and responsive.\n")
+            return True
+
+        if attempt < max_attempts:
+            print(f"â³ [{service_name}] Unavailable. Retrying in {delay:.1f}s...")
+            time.sleep(delay)
+            delay *= backoff_factor
+
+    print(f"âŒ [{service_name}] All {max_attempts} attempts failed.\n")
+    return False
+
+# ==============================================================================
+# 6. AUTONOMOUS MISSION EXECUTOR
+# ==============================================================================
+
+def execute_autonomous_mission(mission_goal: str):
+    current_memory = memory_store.read_all()
+
+    system_prompt = (
+        "You are an autonomous Site Reliability Engineering (SRE) Agent for Kubernetes on Docker Desktop.\n"
+        "DIRECTIVES:\n"
+        "1. Complete the objective end-to-end autonomously. DO NOT ask conversational questions or prompt the user for routine decisions.\n"
+        "2. If a read-only tool fails, analyze the error, self-correct, and retry.\n"
+        "3. Only invoke 'delete_pod' if strictly necessary to resolve the objective. The system will automatically gate it for human approval.\n"
+        "4. Once all goals are satisfied, write any notable facts to semantic memory and deliver a final diagnostic summary.\n\n"
+        f"--- MEMORY CONTEXT ---\n"
+        f"Semantic Baseline: {json.dumps(current_memory['semantic_memory'])}\n"
+        f"Runbooks: {json.dumps(current_memory['procedural_memory'])}\n"
+    )
+
+
+    thread_id = f"mission-{int(time.time())}"
+    config_dict = {"configurable": {"thread_id": thread_id}}
+
+    initial_input = {
+        "messages": [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=mission_goal)
+        ]
+    }
+
+    print(f"=======================================================")
+    print(f"ðŸŽ¯ AUTONOMOUS MISSION STARTED: {mission_goal}")
+    print(f"=======================================================\n")
+
+    current_input = initial_input
+
+    while True:
+        # Stream autonomously until an END or INTERRUPT
+        for event in app.stream(current_input, config=config_dict, stream_mode="values"):
+            latest_msg = event["messages"][-1]
+
+            if hasattr(latest_msg, "tool_calls") and latest_msg.tool_calls:
+                for c in latest_msg.tool_calls:
+                    print(f"âš¡ [Action]: {c['name']} -> {c['args']}")
+            elif latest_msg.type == "tool":
+                snippet = latest_msg.content.replace('\n', ' ')
+                print(f"ðŸ‘ï¸  [Observation]: {snippet[:120]}...")
+            elif latest_msg.type == "ai" and not latest_msg.tool_calls:
+                print(f"\nðŸ [Mission Complete]:\n{latest_msg.content}\n")
+
+                memory_store.record_episode(
+                    task=mission_goal,
+                    summary="Fully Autonomous Mission Run",
+                    outcome=latest_msg.content[:250]
+                )
+                print("ðŸ’¾ Episode logged to persistent flat file.")
+
+        # Check if execution paused at the destructive guardrail
+        state = app.get_state(config_dict)
+        if state.next and "destructive_guardrail" in state.next:
+            last_msg = state.values["messages"][-1]
+            pending_action = last_msg.tool_calls[0]
+
+            print("\n" + "!" * 60)
+            print("ðŸš¨ CRITICAL GUARDRAIL INTERRUPT: Destructive Action Pending!")
+            print(f"   Target Action : {pending_action['name']}")
+            print(f"   Parameters    : {pending_action['args']}")
+            print("!" * 60)
+
+            auth = input("Authorize destructive execution? (yes/no): ").strip().lower()
+            if auth in ("y", "yes"):
+                print("âœ… Authorization GRANTED. Resuming execution...\n")
+                current_input = None
+            else:
+                print("ðŸ›‘ Authorization DENIED. Informing agent to abort action...\n")
+                abort_msg = HumanMessage(content="Action rejected by operator due to policy guardrails. Abort this action and summarize current state.")
+                current_input = {"messages": [abort_msg]}
+        else:
+            break
+
+# ==============================================================================
+# 7. MAIN ENTRY POINT
+# ==============================================================================
+
+if __name__ == "__main__":
+    print("ðŸš€ Initiating system pre-flight checks...\n")
+
+    llm_ok = retry_check(
+        check_fn=lambda: verify_llm_connectivity("http://localhost:8080/v1/models", timeout_seconds=2),
+        service_name="Local LLM (:8080)",
+        max_attempts=3,
+        initial_backoff=1.0,
+        backoff_factor=2.0
+    )
+
+    k8s_ok = retry_check(
+        check_fn=lambda: verify_cluster_connectivity(timeout_seconds=2),
+        service_name="Docker Desktop Kubernetes",
+        max_attempts=3,
+        initial_backoff=1.0,
+        backoff_factor=2.0
+    )
+
+    if not (llm_ok and k8s_ok):
+        print("ðŸ›‘ Aborting agent execution: One or more dependencies failed pre-flight checks.")
+        sys.exit(1)
+
+    print("ðŸŽ‰ All systems online. Starting autonomous mission...\n")
+
+    mission = (
+        "Assess node health on docker-desktop, list pods in default namespace, "
+        "and record an updated cluster check date in semantic memory."
+    )
+    execute_autonomous_mission(mission)
