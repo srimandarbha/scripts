@@ -1,0 +1,918 @@
+# GOAL-BASED SRE AGENT - COMPLETE CODEBASE
+# Single-file GitHub upload bundle. Each section begins with its repository path.
+
+
+==========================================================================================
+# FILE: README.md
+==========================================================================================
+# Goal-Based SRE Agent
+
+Reference implementation of a goal-directed LangGraph SRE agent.
+
+Flow:
+Kafka Alert -> Goal Builder -> Reason -> Tool -> Action/Evidence -> Goal Evaluator -> Continue/Approval/Finish
+
+The included tools simulate an OCV/MTV environment. Replace them with real MCP,
+AAP, Prometheus, Kafka, ServiceNow, or database integrations.
+
+Quick start:
+
+    python -m venv .venv
+    source .venv/bin/activate
+    pip install -r requirements.txt
+    python main.py --mock-llm
+
+Production principles:
+- The LLM does not directly operate Kubernetes.
+- Tools are allow-listed and policy constrained.
+- Mutations go through deterministic automation such as AAP.
+- Evidence proves goal progress.
+- An accepted remediation request is not proof that remediation succeeded.
+- Kafka offsets should be committed only after durable processing/checkpointing.
+
+==========================================================================================
+# FILE: requirements.txt
+==========================================================================================
+langgraph>=0.2
+langchain-core>=0.3
+langchain-openai>=0.2
+pydantic>=2.7
+kafka-python>=2.0
+python-dotenv>=1.0
+
+==========================================================================================
+# FILE: .env.example
+==========================================================================================
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-5.6
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+KAFKA_TOPIC=ocv-alerts
+KAFKA_GROUP_ID=goal-based-sre-agent
+MAX_ITERATIONS=12
+
+==========================================================================================
+# FILE: config.py
+==========================================================================================
+import os
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Settings:
+    openai_api_key: str | None = os.getenv("OPENAI_API_KEY")
+    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-5.6")
+    kafka_bootstrap_servers: str = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+    kafka_topic: str = os.getenv("KAFKA_TOPIC", "ocv-alerts")
+    kafka_group_id: str = os.getenv("KAFKA_GROUP_ID", "goal-based-sre-agent")
+    max_iterations: int = int(os.getenv("MAX_ITERATIONS", "12"))
+
+settings = Settings()
+
+==========================================================================================
+# FILE: models.py
+==========================================================================================
+from __future__ import annotations
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any
+from pydantic import BaseModel, Field
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+class Alert(BaseModel):
+    alert_id: str
+    alert_type: str
+    severity: str
+    cluster: str
+    namespace: str | None = None
+    vm: str | None = None
+    migration: str | None = None
+    timestamp: str = Field(default_factory=now_iso)
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+
+class Goal(BaseModel):
+    goal_id: str
+    policy_name: str
+    objective: str
+    success_conditions: list[str]
+    constraints: list[str]
+    context: dict[str, Any] = Field(default_factory=dict)
+
+class Evidence(BaseModel):
+    evidence_id: str
+    iteration: int
+    source: str
+    timestamp: str = Field(default_factory=now_iso)
+    observation: dict[str, Any]
+    reliability: str = "normal"
+    supports: list[str] = Field(default_factory=list)
+    contradicts: list[str] = Field(default_factory=list)
+
+class Action(BaseModel):
+    action_id: str
+    iteration: int
+    tool: str
+    purpose: str
+    input: dict[str, Any] = Field(default_factory=dict)
+    status: str
+    result: dict[str, Any] | None = None
+    approval_required: bool = False
+    approval_status: str | None = None
+    timestamp: str = Field(default_factory=now_iso)
+
+class DecisionType(str, Enum):
+    INVESTIGATE = "INVESTIGATE"
+    REMEDIATE = "REMEDIATE"
+    COMPLETE = "COMPLETE"
+    BLOCKED = "BLOCKED"
+
+class ToolDecision(BaseModel):
+    decision: DecisionType
+    tool: str | None = None
+    reason: str
+    expected_information: str
+    expected_goal_progress: str
+
+class GoalStatus(str, Enum):
+    IN_PROGRESS = "IN_PROGRESS"
+    ACHIEVED = "ACHIEVED"
+    FAILED = "FAILED"
+    BLOCKED = "BLOCKED"
+    APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
+
+class GoalEvaluation(BaseModel):
+    status: GoalStatus
+    reason: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    satisfied_conditions: list[str] = Field(default_factory=list)
+    missing_conditions: list[str] = Field(default_factory=list)
+    approval_required: bool = False
+
+class ToolResult(BaseModel):
+    success: bool
+    result: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+
+class ToolSpec(BaseModel):
+    name: str
+    description: str
+    capability: str
+    read_only: bool
+    requires_approval: bool
+    timeout_seconds: int = 30
+
+==========================================================================================
+# FILE: goal_policies.py
+==========================================================================================
+from __future__ import annotations
+import uuid
+from models import Alert, Goal
+
+POLICIES = {
+    "MigrationFailed": {
+        "policy_name": "migration_failure_recovery",
+        "objective": "Determine why the migration failed using sufficient independent evidence and recover the migration when a safe deterministic recovery exists.",
+        "success_conditions": [
+            "migration_failure_confirmed",
+            "root_cause_identified_with_supporting_evidence",
+            "recovery_attempted_when_safe_or_recovery_is_not_possible",
+            "post_recovery_migration_progress_confirmed_or_failure_is_proven_unrecoverable",
+        ],
+        "constraints": [
+            "Do not delete the VM.",
+            "Do not change cluster configuration.",
+            "Do not change storage configuration.",
+            "Do not directly patch Kubernetes objects for remediation.",
+            "Disruptive remediation requires explicit approval.",
+        ],
+    },
+    "MigrationAtRisk": {
+        "policy_name": "migration_risk_control",
+        "objective": "Determine whether the migration is at risk of missing its change window, identify the bottleneck, and take only an approved safe action.",
+        "success_conditions": [
+            "migration_progress_or_stall_confirmed",
+            "current_eta_or_insufficient_data_determined",
+            "primary_bottleneck_identified_or_proven_unknown",
+            "safe_recovery_or_escalation_decision_recorded",
+        ],
+        "constraints": [
+            "Do not delete the VM.",
+            "Do not change cluster configuration.",
+            "Do not change storage configuration.",
+            "Do not fabricate ETA when insufficient samples exist.",
+        ],
+    },
+}
+
+def build_goal(alert: Alert) -> Goal:
+    policy = POLICIES.get(alert.alert_type)
+    if not policy:
+        raise ValueError(f"No goal policy registered for alert type: {alert.alert_type}")
+    return Goal(
+        goal_id=str(uuid.uuid4()),
+        policy_name=policy["policy_name"],
+        objective=policy["objective"],
+        success_conditions=policy["success_conditions"],
+        constraints=policy["constraints"],
+        context={
+            "alert_id": alert.alert_id,
+            "alert_type": alert.alert_type,
+            "cluster": alert.cluster,
+            "namespace": alert.namespace,
+            "vm": alert.vm,
+            "migration": alert.migration,
+        },
+    )
+
+==========================================================================================
+# FILE: tools.py
+==========================================================================================
+from __future__ import annotations
+import time
+from typing import Any, Callable
+from models import Alert, Goal, ToolResult, ToolSpec
+
+class Tool:
+    def __init__(self, spec: ToolSpec, fn: Callable[..., ToolResult]):
+        self.spec = spec
+        self.fn = fn
+
+    def execute(self, **kwargs: Any) -> ToolResult:
+        return self.fn(**kwargs)
+
+SIMULATED = {
+    "migration_status": {
+        "state": "Failed",
+        "reason": "DiskTransferV2vFailed",
+        "migration": "migration-4821",
+    },
+    "logs": {
+        "error": "VDDK source datastore request timeout",
+        "component": "disk-transfer",
+        "retry_count": 5,
+    },
+    "storage": {
+        "source_latency_ms": 185,
+        "source_utilization_pct": 96,
+        "destination_latency_ms": 4,
+        "source_datastore": "vsphere-ds-17",
+    },
+    "progress": {
+        "state": "Running",
+        "progress_pct": 81,
+        "throughput_mb_s": 150,
+        "eta_minutes": 11,
+    },
+    "resumed": False,
+}
+
+def get_migration_status(alert: Alert, goal: Goal, **_) -> ToolResult:
+    return ToolResult(success=True, result=SIMULATED["migration_status"])
+
+def get_migration_logs(alert: Alert, goal: Goal, **_) -> ToolResult:
+    return ToolResult(success=True, result=SIMULATED["logs"])
+
+def get_storage_metrics(alert: Alert, goal: Goal, **_) -> ToolResult:
+    return ToolResult(success=True, result=SIMULATED["storage"])
+
+def get_migration_progress(alert: Alert, goal: Goal, **_) -> ToolResult:
+    if not SIMULATED["resumed"]:
+        return ToolResult(success=True, result={
+            "state": "Failed", "progress_pct": 62, "throughput_mb_s": 0
+        })
+    return ToolResult(success=True, result=SIMULATED["progress"])
+
+def resume_migration(alert: Alert, goal: Goal, **_) -> ToolResult:
+    SIMULATED["resumed"] = True
+    # Request acceptance is NOT proof of recovery.
+    return ToolResult(success=True, result={
+        "request": "accepted",
+        "migration": alert.migration,
+        "message": "Resume request accepted",
+    })
+
+TOOLS = {
+    "get_migration_status": Tool(
+        ToolSpec(
+            name="get_migration_status",
+            description="Read current MTV migration state and failure reason.",
+            capability="migration_observation",
+            read_only=True,
+            requires_approval=False,
+        ), get_migration_status),
+    "get_migration_logs": Tool(
+        ToolSpec(
+            name="get_migration_logs",
+            description="Read migration/controller logs associated with the failure.",
+            capability="migration_observation",
+            read_only=True,
+            requires_approval=False,
+        ), get_migration_logs),
+    "get_storage_metrics": Tool(
+        ToolSpec(
+            name="get_storage_metrics",
+            description="Read source and destination storage latency and utilization.",
+            capability="storage_observation",
+            read_only=True,
+            requires_approval=False,
+        ), get_storage_metrics),
+    "get_migration_progress": Tool(
+        ToolSpec(
+            name="get_migration_progress",
+            description="Read live migration progress, throughput and ETA.",
+            capability="migration_observation",
+            read_only=True,
+            requires_approval=False,
+        ), get_migration_progress),
+    "resume_migration": Tool(
+        ToolSpec(
+            name="resume_migration",
+            description="Request deterministic migration recovery through an approved automation path.",
+            capability="migration_recovery",
+            read_only=False,
+            requires_approval=True,
+        ), resume_migration),
+}
+
+def tool_catalog() -> list[ToolSpec]:
+    return [tool.spec for tool in TOOLS.values()]
+
+==========================================================================================
+# FILE: evaluator.py
+==========================================================================================
+from models import Goal, GoalEvaluation, Evidence, Action, GoalStatus
+
+def deterministic_checks(goal: Goal, evidence: list[Evidence], actions: list[Action]) -> dict:
+    checks = {
+        "migration_failure_confirmed": False,
+        "root_cause_supported": False,
+        "recovery_attempted": False,
+        "post_recovery_progress_confirmed": False,
+    }
+
+    for e in evidence:
+        o = e.observation
+        if o.get("state") == "Failed":
+            checks["migration_failure_confirmed"] = True
+        if o.get("source_latency_ms", 0) >= 150 and o.get("source_utilization_pct", 0) >= 90:
+            checks["root_cause_supported"] = True
+        if o.get("progress_pct", 0) > 0 and o.get("throughput_mb_s", 0) > 0:
+            checks["post_recovery_progress_confirmed"] = True
+
+    for a in actions:
+        if a.tool == "resume_migration" and a.status == "SUCCEEDED":
+            checks["recovery_attempted"] = True
+
+    return checks
+
+def evaluate_goal(goal: Goal, evidence: list[Evidence], actions: list[Action]) -> GoalEvaluation:
+    checks = deterministic_checks(goal, evidence, actions)
+    mapping = {
+        "migration_failure_confirmed": "migration_failure_confirmed",
+        "root_cause_supported": "root_cause_identified_with_supporting_evidence",
+        "recovery_attempted": "recovery_attempted_when_safe_or_recovery_is_not_possible",
+        "post_recovery_progress_confirmed": "post_recovery_migration_progress_confirmed_or_failure_is_proven_unrecoverable",
+    }
+
+    satisfied = [condition for key, condition in mapping.items() if checks[key]]
+    missing = [condition for key, condition in mapping.items() if not checks[key]]
+
+    if all(checks.values()):
+        return GoalEvaluation(
+            status=GoalStatus.ACHIEVED,
+            reason="All deterministic success conditions are satisfied.",
+            confidence=1.0,
+            satisfied_conditions=satisfied,
+        )
+
+    return GoalEvaluation(
+        status=GoalStatus.IN_PROGRESS,
+        reason="The goal has not yet satisfied all success conditions.",
+        confidence=0.95,
+        satisfied_conditions=satisfied,
+        missing_conditions=missing,
+    )
+
+==========================================================================================
+# FILE: agent.py
+==========================================================================================
+from __future__ import annotations
+import json
+import uuid
+from typing import Any, TypedDict
+from langgraph.graph import StateGraph, END
+from config import settings
+from evaluator import evaluate_goal
+from goal_policies import build_goal
+from models import Alert, Goal, Evidence, Action, ToolDecision, DecisionType, GoalStatus
+from tools import TOOLS
+
+class SREState(TypedDict, total=False):
+    alert: Alert
+    goal: Goal
+    evidence: list[Evidence]
+    actions: list[Action]
+    hypothesis: str
+    decision: ToolDecision | None
+    last_result: dict[str, Any] | None
+    goal_status: str
+    goal_reason: str
+    missing_conditions: list[str]
+    approval_required: bool
+    approval_granted: bool
+    iteration: int
+    max_iterations: int
+
+def deterministic_mock_decision(state: SREState) -> ToolDecision:
+    evidence = state.get("evidence", [])
+    actions = state.get("actions", [])
+
+    def seen(source: str) -> bool:
+        return any(e.source == source for e in evidence)
+
+    def done(tool: str) -> bool:
+        return any(a.tool == tool and a.status == "SUCCEEDED" for a in actions)
+
+    if not seen("get_migration_status"):
+        return ToolDecision(
+            decision=DecisionType.INVESTIGATE,
+            tool="get_migration_status",
+            reason="Confirm the migration failure first.",
+            expected_information="Current migration state and failure reason.",
+            expected_goal_progress="Satisfy migration_failure_confirmed.",
+        )
+
+    if not seen("get_migration_logs"):
+        return ToolDecision(
+            decision=DecisionType.INVESTIGATE,
+            tool="get_migration_logs",
+            reason="Collect controller evidence explaining the failure.",
+            expected_information="Specific failure/error evidence.",
+            expected_goal_progress="Advance root_cause_identified_with_supporting_evidence.",
+        )
+
+    if not seen("get_storage_metrics"):
+        return ToolDecision(
+            decision=DecisionType.INVESTIGATE,
+            tool="get_storage_metrics",
+            reason="Corroborate whether source storage is the bottleneck.",
+            expected_information="Latency and utilization evidence.",
+            expected_goal_progress="Corroborate the root cause independently.",
+        )
+
+    if not done("resume_migration"):
+        return ToolDecision(
+            decision=DecisionType.REMEDIATE,
+            tool="resume_migration",
+            reason="Evidence supports a transient source-storage bottleneck.",
+            expected_information="Resume request result.",
+            expected_goal_progress="Satisfy recovery_attempted_when_safe_or_recovery_is_not_possible.",
+        )
+
+    if not seen("get_migration_progress"):
+        return ToolDecision(
+            decision=DecisionType.INVESTIGATE,
+            tool="get_migration_progress",
+            reason="Verify actual recovery; request acceptance is not recovery.",
+            expected_information="Running state, progress and throughput.",
+            expected_goal_progress="Satisfy post_recovery_migration_progress_confirmed_or_failure_is_proven_unrecoverable.",
+        )
+
+    return ToolDecision(
+        decision=DecisionType.COMPLETE,
+        tool=None,
+        reason="Required evidence has been collected.",
+        expected_information="None.",
+        expected_goal_progress="Allow evaluator to determine completion.",
+    )
+
+def reason(state: SREState) -> dict:
+    # Replace this with an LLM structured-output call in production.
+    return {"decision": deterministic_mock_decision(state)}
+
+def execute_tool(state: SREState) -> dict:
+    decision = state.get("decision")
+    if not decision or not decision.tool:
+        return {}
+
+    tool = TOOLS.get(decision.tool)
+    if not tool:
+        raise ValueError(f"Tool is not registered: {decision.tool}")
+
+    if tool.spec.requires_approval and not state.get("approval_granted", False):
+        return {
+            "goal_status": GoalStatus.APPROVAL_REQUIRED.value,
+            "goal_reason": f"Approval required before executing {decision.tool}.",
+            "approval_required": True,
+        }
+
+    result = tool.execute(alert=state["alert"], goal=state["goal"])
+
+    action = Action(
+        action_id=str(uuid.uuid4()),
+        iteration=state["iteration"],
+        tool=decision.tool,
+        purpose=decision.expected_goal_progress,
+        input={
+            "alert_id": state["alert"].alert_id,
+            "cluster": state["alert"].cluster,
+            "migration": state["alert"].migration,
+        },
+        status="SUCCEEDED" if result.success else "FAILED",
+        result=result.result if result.success else {"error": result.error},
+        approval_required=tool.spec.requires_approval,
+        approval_status="APPROVED" if tool.spec.requires_approval else None,
+    )
+
+    evidence = Evidence(
+        evidence_id=str(uuid.uuid4()),
+        iteration=state["iteration"],
+        source=decision.tool,
+        observation=result.result if result.success else {"error": result.error},
+        reliability="high" if result.success else "low",
+        supports=[decision.expected_goal_progress] if result.success else [],
+    )
+
+    return {
+        "last_result": result.result if result.success else {"error": result.error},
+        "actions": state.get("actions", []) + [action],
+        "evidence": state.get("evidence", []) + [evidence],
+        "iteration": state["iteration"] + 1,
+    }
+
+def evaluate(state: SREState) -> dict:
+    result = evaluate_goal(state["goal"], state.get("evidence", []), state.get("actions", []))
+    return {
+        "goal_status": result.status.value,
+        "goal_reason": result.reason,
+        "missing_conditions": result.missing_conditions,
+        "approval_required": result.approval_required,
+    }
+
+def route_after_evaluation(state: SREState) -> str:
+    status = state.get("goal_status")
+    if status == GoalStatus.ACHIEVED.value:
+        return "finish"
+    if status in (GoalStatus.FAILED.value, GoalStatus.BLOCKED.value):
+        return "finish"
+    if status == GoalStatus.APPROVAL_REQUIRED.value:
+        return "approval"
+    if state.get("iteration", 0) >= state.get("max_iterations", settings.max_iterations):
+        return "finish"
+    return "reason"
+
+def approval(state: SREState) -> dict:
+    # Demo only. Production should pause and wait for a durable external approval.
+    return {
+        "approval_granted": True,
+        "approval_required": False,
+        "goal_status": GoalStatus.IN_PROGRESS.value,
+        "goal_reason": "Demo approval granted.",
+    }
+
+def finish(state: SREState) -> dict:
+    return {}
+
+def build_graph():
+    graph = StateGraph(SREState)
+    graph.add_node("reason", reason)
+    graph.add_node("execute_tool", execute_tool)
+    graph.add_node("evaluate", evaluate)
+    graph.add_node("approval", approval)
+    graph.add_node("finish", finish)
+
+    graph.set_entry_point("reason")
+    graph.add_edge("reason", "execute_tool")
+    graph.add_conditional_edges(
+        "execute_tool",
+        lambda s: "approval" if s.get("goal_status") == GoalStatus.APPROVAL_REQUIRED.value else "evaluate",
+        {"approval": "approval", "evaluate": "evaluate"},
+    )
+    graph.add_edge("approval", "reason")
+    graph.add_conditional_edges(
+        "evaluate",
+        route_after_evaluation,
+        {"reason": "reason", "approval": "approval", "finish": "finish"},
+    )
+    graph.add_edge("finish", END)
+    return graph.compile()
+
+def new_state(alert: Alert) -> SREState:
+    return {
+        "alert": alert,
+        "goal": build_goal(alert),
+        "evidence": [],
+        "actions": [],
+        "hypothesis": "",
+        "decision": None,
+        "last_result": None,
+        "goal_status": GoalStatus.IN_PROGRESS.value,
+        "goal_reason": "",
+        "missing_conditions": [],
+        "approval_required": False,
+        "approval_granted": False,
+        "iteration": 0,
+        "max_iterations": settings.max_iterations,
+    }
+
+def run_alert(alert: Alert) -> SREState:
+    return build_graph().invoke(new_state(alert))
+
+def print_run(state: SREState) -> None:
+    print("\n=== GOAL ===")
+    print(json.dumps(state["goal"].model_dump(), indent=2))
+    print("\n=== ACTIONS ===")
+    for item in state.get("actions", []):
+        print(json.dumps(item.model_dump(), indent=2))
+    print("\n=== EVIDENCE ===")
+    for item in state.get("evidence", []):
+        print(json.dumps(item.model_dump(), indent=2))
+    print("\n=== FINAL EVALUATION ===")
+    print("status:", state.get("goal_status"))
+    print("reason:", state.get("goal_reason"))
+    print("missing:", state.get("missing_conditions", []))
+    print("iterations:", state.get("iteration"))
+
+==========================================================================================
+# FILE: main.py
+==========================================================================================
+from __future__ import annotations
+import argparse
+import json
+from agent import run_alert, print_run
+from models import Alert
+
+def demo_alert() -> Alert:
+    return Alert(
+        alert_id="alert-10001",
+        alert_type="MigrationFailed",
+        severity="critical",
+        cluster="ocv-prod-07",
+        namespace="migration-workloads",
+        vm="vm-finance-4821",
+        migration="migration-4821",
+        labels={"component": "mtv"},
+        annotations={"source": "ocv-alerts"},
+    )
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mock-llm", action="store_true")
+    parser.add_argument("--alert-json")
+    args = parser.parse_args()
+
+    alert = Alert.model_validate(json.loads(args.alert_json)) if args.alert_json else demo_alert()
+    print_run(run_alert(alert))
+
+if __name__ == "__main__":
+    main()
+
+==========================================================================================
+# FILE: kafka_consumer.py
+==========================================================================================
+from __future__ import annotations
+import json
+from kafka import KafkaConsumer
+from config import settings
+from models import Alert
+from agent import run_alert
+
+def consume():
+    consumer = KafkaConsumer(
+        settings.kafka_topic,
+        bootstrap_servers=settings.kafka_bootstrap_servers,
+        group_id=settings.kafka_group_id,
+        enable_auto_commit=False,
+        auto_offset_reset="latest",
+        value_deserializer=lambda b: json.loads(b.decode("utf-8")),
+    )
+
+    for message in consumer:
+        try:
+            alert = Alert.model_validate(message.value)
+
+            # Production:
+            # 1. Correlate/dedupe alert.
+            # 2. Load/create durable goal.
+            # 3. Resume graph from checkpoint.
+            # 4. Persist state.
+            # 5. Commit Kafka offset only after durable processing.
+            final_state = run_alert(alert)
+
+            print(
+                f"alert={alert.alert_id} "
+                f"goal={final_state['goal'].goal_id} "
+                f"status={final_state.get('goal_status')}"
+            )
+            consumer.commit()
+        except Exception as exc:
+            print(f"processing failed: {exc}")
+
+if __name__ == "__main__":
+    consume()
+
+==========================================================================================
+# FILE: tests/test_goal_flow.py
+==========================================================================================
+from agent import run_alert
+from models import Alert, GoalStatus
+
+def test_migration_failure_goal_reaches_achievement():
+    alert = Alert(
+        alert_id="test-1",
+        alert_type="MigrationFailed",
+        severity="critical",
+        cluster="test-cluster",
+        namespace="test",
+        vm="test-vm",
+        migration="migration-test",
+    )
+
+    state = run_alert(alert)
+
+    assert state["goal_status"] == GoalStatus.ACHIEVED.value
+    assert len(state["actions"]) >= 5
+    assert len(state["evidence"]) >= 5
+
+    assert any(
+        e.source == "get_migration_progress"
+        and e.observation.get("state") == "Running"
+        for e in state["evidence"]
+    )
+
+==========================================================================================
+# FILE: schemas/alert.example.json
+==========================================================================================
+{
+  "alert_id": "alert-10001",
+  "alert_type": "MigrationFailed",
+  "severity": "critical",
+  "cluster": "ocv-prod-07",
+  "namespace": "migration-workloads",
+  "vm": "vm-finance-4821",
+  "migration": "migration-4821",
+  "labels": {"component": "mtv"},
+  "annotations": {"source": "ocv-alerts"}
+}
+
+==========================================================================================
+# FILE: schemas/goal.example.json
+==========================================================================================
+{
+  "goal_id": "generated-uuid",
+  "policy_name": "migration_failure_recovery",
+  "objective": "Determine why the migration failed using sufficient independent evidence and recover the migration when a safe deterministic recovery exists.",
+  "success_conditions": [
+    "migration_failure_confirmed",
+    "root_cause_identified_with_supporting_evidence",
+    "recovery_attempted_when_safe_or_recovery_is_not_possible",
+    "post_recovery_migration_progress_confirmed_or_failure_is_proven_unrecoverable"
+  ],
+  "constraints": [
+    "Do not delete the VM.",
+    "Do not change cluster configuration.",
+    "Do not change storage configuration.",
+    "Do not directly patch Kubernetes objects for remediation.",
+    "Disruptive remediation requires explicit approval."
+  ]
+}
+
+==========================================================================================
+# FILE: architecture.md
+==========================================================================================
+# Goal-directed control loop
+
+CURRENT STATE
+    |
+    v
+REASON
+    |
+    | ToolDecision
+    v
+EXECUTE TOOL
+    |
+    +--> Action record
+    +--> Evidence record
+    |
+    v
+GOAL EVALUATOR
+    |
+    +--> ACHIEVED ------> FINISH
+    +--> FAILED/BLOCKED -> FINISH
+    +--> APPROVAL ------> APPROVAL -> REASON
+    +--> IN_PROGRESS ---> REASON
+
+The goal is relatively stable during an incident:
+- objective
+- success_conditions
+- constraints
+
+The state evolves:
+- evidence += observation
+- actions += attempted tool
+- decision = next tool
+- iteration += 1
+- evaluation = current status
+
+Evidence answers: "What did we observe?"
+Action answers: "What did the agent actually attempt?"
+
+Example:
+resume_migration -> request accepted
+
+That does NOT prove recovery.
+
+Later:
+get_migration_progress -> Running, 81%, 150 MB/s
+
+That is the evidence used to prove recovery.
+
+Recommended production boundaries:
+1. Goal Policy
+2. Agent / Reasoner
+3. Tool Gateway
+4. Deterministic Automation
+5. Goal Evaluator
+6. Durable State Store
+7. Kafka Event Bus
+
+The model should never receive unrestricted Kubernetes credentials.
+
+==========================================================================================
+# FILE: production-hardening.md
+==========================================================================================
+# Production hardening
+
+## Durable checkpoints
+Use a Postgres-backed LangGraph checkpointer so goals resume after crashes,
+pod restarts, approval waits and transient failures.
+
+## Alert correlation
+Do not create a new goal for every duplicate Kafka message.
+
+Example correlation key:
+cluster + alert_type + migration_or_resource_identity
+
+Store:
+- correlation key
+- active goal id
+- Kafka event/offset
+- status
+- updated timestamp
+
+## Tool gateway
+Do not expose hundreds of raw tools to the model. Filter an allow-list by
+alert type, goal, capability and constraints.
+
+## MCP
+A production layout can be:
+
+LangGraph
+  -> MCP client
+      -> Observability MCP
+      -> OCV/MTV read-only MCP
+      -> AAP automation MCP
+      -> ServiceNow MCP
+
+The MCP server must enforce authorization independently of the model.
+
+## Approval
+Replace the demo boolean with a durable ServiceNow/AAP approval workflow.
+
+## Evidence provenance
+Persist:
+- source system
+- tool/query
+- timestamp
+- resource identity
+- observation window
+- raw event/metric/log reference
+- reliability
+- correlation id
+
+## Deterministic evaluation
+Use code for objective checks:
+- migration phase
+- progress increasing
+- ETA vs deadline
+- AAP job state
+- alert cleared
+- required resource exists
+
+Use an LLM only where interpretation is genuinely required.
+
+## Budgets
+Enforce:
+- max iterations
+- wall-clock deadline
+- tool-call limit
+- model token/cost limit
+- tool timeout
+- retry limit
+
+## Audit
+Persist:
+goal -> decision -> tool call -> result -> evidence -> evaluation
+
+That chain is the primary audit trail for debugging the agent.
