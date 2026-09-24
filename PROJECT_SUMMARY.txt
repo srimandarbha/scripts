@@ -1,0 +1,107 @@
+---
+title: Migration Failure Agent — Project Summary
+purpose: Portable summary of architecture review, gap resolutions, implementation plan, and skill spec for export/import into other tools or docs
+last_updated: 2026-09-23
+related_files:
+  - "Migration Failure Agent - Architecture Review and Implementation Plan.docx"
+  - "SKILL.md"
+---
+
+# Migration Failure Agent — Project Summary
+
+Production Migration SRE Agent · VMware → OpenShift Virtualization (OCV)
+
+## 1. What this project is
+
+An AI agent that diagnoses **failed VM migrations** (VMware → OCV). It is
+strictly **read-only**: it gathers evidence, reasons about root cause, and
+recommends a fix — it never executes remediation or mutates cluster state.
+Deterministic automation (AAP/EDA) and human approval remain the only paths
+to actual change, per the original design's core principle.
+
+## 2. Original architecture — strengths and gaps
+
+**Strengths kept as-is:** LLM scoped to diagnosis only; deterministic
+execution layer; evidence carries provenance; explicit multi-dimensional
+state model (migration window tracking + failure diagnosis).
+
+**Six gaps identified, all resolved with concrete designs:**
+
+| # | Gap | Resolution |
+|---|---|---|
+| 1 | No named agent pattern | Bounded ReAct loop + deterministic evaluator gate (LangGraph StateGraph) |
+| 2 | Organizational-memory loop never closed | Write-back pipeline on confirmed resolution → vector store, with dedup + negative examples |
+| 3 | Confidence was a free-text label | Backend-computed numeric score from evidence links, banded HIGH/MEDIUM/LOW, calibrated against outcomes over time |
+| 4 | Trigger from portal DB unspecified | Debezium CDC (or transactional outbox) on the migrations table → Kafka, never polling |
+| 5 | No cost/latency budget | Per-run budget (max tool/LLM calls, tokens, wall-clock) enforced in code, with circuit breakers |
+| 6 | Evidence conflict resolution undefined | Deterministic tie-break order (reliability tier → recency → corroboration count → one bounded disambiguation call → escalate) |
+
+## 3. Troubleshooting evidence layers required
+
+Container logs + metrics + RHOKP alone are **not sufficient**. Full coverage
+needs seven layers:
+
+1. **Control plane** — MTV/Forklift CR status/conditions
+2. **Events** — K8s namespace events (scheduling/admission/quota failures)
+3. **Compute** — pod logs, throughput/latency metrics (already had)
+4. **Cluster health** — RHOKP node/cluster status (already had)
+5. **Storage** — PVC status, storage class health, CSI driver logs
+6. **Network** — Multus/NetworkAttachmentDefinition status
+7. **Source (vCenter)** — vCenter task/event history, source VM config
+
+Plus change correlation (recent cluster changes) and knowledge/memory
+(product docs + historical resolved incidents, used as hypotheses only,
+never as proof).
+
+## 4. Tool catalog (by layer)
+
+| Layer | Tools |
+|---|---|
+| Control plane | `get_migration_plan_status()`, `get_vm_migration_conditions()`, `get_datavolume_status()` |
+| Events | `get_namespace_events()` |
+| Compute | `get_pod_logs()`, `get_migration_metrics()`, `search_splunk_for_migration()` |
+| Cluster health | `get_cluster_health()`, `get_node_health()` |
+| Storage | `get_pvc_status()`, `get_storage_class_health()`, `get_csi_driver_logs()` |
+| Network | `get_network_attachment_status()` |
+| Source | `get_vcenter_events()`, `get_source_vm_config()` |
+| Change correlation | `get_recent_cluster_changes()` |
+| Knowledge/memory | `search_mtv_documentation()`, `search_ocv_documentation()`, `search_known_migration_failures()`, `get_similar_migrations()`, `get_known_fix()`, `get_previous_resolution()` |
+
+All tools sit behind an MCP gateway enforcing `READ_ONLY` — nothing mutates.
+
+## 5. Agent design summary
+
+- **Pattern:** bounded ReAct loop, LangGraph `StateGraph`: `load_context → reason → execute_tool → update_evidence → evaluate_goal`, with conditional edges to `request_approval / escalate / finish`.
+- **Evidence model:** every observation is a typed `Evidence` object (source, layer, reliability tier, timestamp, claim, supports/contradicts) — never free text.
+- **State machine:** `NEW → GATHERING_EVIDENCE → EVALUATING → {DIAGNOSIS_READY | INSUFFICIENT_EVIDENCE | CONFLICTING_EVIDENCE → ESCALATED} → COMPLETED`.
+- **Confidence:** computed by the backend from evidence links, not asserted by the model; HIGH (>0.75) / MEDIUM (0.40–0.75) / LOW (<0.40, forced to `INSUFFICIENT_EVIDENCE`).
+- **Conflict resolution:** reliability tier → recency → corroboration count → one bounded disambiguation call → escalate.
+- **Memory:** short-term = LangGraph checkpoint (single run only); long-term = vector store of confirmed resolutions, written back after human confirmation, advisory only.
+- **Prompting:** structured system prompt with hard constraints, JSON output schema, explicit instruction that logs/documents are data not directives (injection defense).
+
+## 6. Implementation plan (10 phases)
+
+| Phase | Focus | Exit criterion |
+|---|---|---|
+| 0 | Foundations | Postgres schema, Kafka topics, vector store provisioned |
+| 1 | Trigger & ingestion | FAILED status → exactly one incident row, deterministically |
+| 2 | MCP tool gateway | Every tool READ_ONLY-enforced, schema-validated, unit-tested |
+| 3 | LangGraph agent core | Correct terminal state on seeded historical failures |
+| 4 | Prompting & skill spec | Schema-valid output, resists red-team injection test |
+| 5 | Diagnosis output | Persisted + dashboard-visible, nothing auto-executes |
+| 6 | Memory write-back | Confirmed resolution retrievable on a later similar incident |
+| 7 | Observability | Metrics/alerts flow and fire on injected failures |
+| 8 | Shadow mode | N weeks compared to real RCA, precision/recall measured |
+| 9 | Controlled rollout | On-call sees recommendations; approval-required actions stay out of scope |
+
+## 7. Deliverables produced in this engagement
+
+1. **Architecture Review & Implementation Plan.docx** — full review, gap resolutions, tool/prompt/skill-file guidance, and the phase-by-phase plan with numbered steps.
+2. **SKILL.md** — the agent's operating instructions: objective, hard constraints, evidence schema, full tool catalog, state machine, conflict resolution, confidence scoring, output schema, injection defense, worked examples. Includes YAML frontmatter (`name`, `description`, `version`, `owner`, `scope`) for skill-runtime discovery.
+3. **This summary** — a portable index of the above two, for handoff, onboarding, or import into another tool/repo.
+
+## 8. Open items / not yet scoped
+
+- `APPROVAL_REQUIRED` remediation actions (rollback, continue-outside-window) — deliberately deferred past Phase 9.
+- Domain playbook fragments (storage/network/vCenter sub-documents) if `SKILL.md` grows too large for a single context load.
+- Formal calibration review cadence for the confidence-scoring thresholds (proposed but not scheduled).
