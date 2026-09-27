@@ -26,6 +26,58 @@ try:
 except ImportError:  # pragma: no cover — degrade to a no-op validator if unavailable
     jsonschema = None
 
+try:
+    import anthropic
+except ImportError:  # pragma: no cover — real dependency in production; must be installed
+    anthropic = None
+
+
+# ---------------------------------------------------------------------------
+# LLM client — the actual model call every prompted node uses. Replaces the
+# `lambda: "..."` placeholders that were sitting in for this everywhere
+# (goal_builder, reason, evaluate_goal's critic, compose_diagnosis, and the
+# action drafter). Every one of those call sites now does
+# `llm_call=lambda: call_llm(prompt)` instead of a hardcoded string.
+# ---------------------------------------------------------------------------
+
+DEFAULT_MODEL = "claude-sonnet-4-6"
+
+_client: Optional["anthropic.Anthropic"] = None
+
+
+def _get_client() -> "anthropic.Anthropic":
+    global _client
+    if anthropic is None:
+        raise RuntimeError(
+            "anthropic package not installed. Run: pip install anthropic"
+        )
+    if _client is None:
+        _client = anthropic.Anthropic(api_key=get_secret("anthropic_api_key"))
+    return _client
+
+
+def call_llm(prompt: str, system: Optional[str] = None,
+             model: str = DEFAULT_MODEL, max_tokens: int = 1024) -> str:
+    """The single real LLM call used everywhere in this codebase. Every
+    prompted node (goal_builder, reason, evaluate_goal's critic,
+    compose_diagnosis, and migration_failure_agent_actions.py's drafter)
+    calls this — directly for plain-text output (goal_builder), or wrapped
+    in call_llm_with_schema() below for anything that must return valid
+    JSON. Credentials come from get_secret(), never hardcoded.
+
+    Raises whatever the anthropic SDK raises on failure (rate limit, auth,
+    timeout) — callers that need retry/fail-closed behavior wrap this in
+    call_llm_with_schema, which already retries and fails closed. A caller
+    that wants plain text (goal_builder) should catch exceptions itself and
+    fail closed to a safe default goal/summary rather than crashing the run."""
+    client = _get_client()
+    kwargs = {"model": model, "max_tokens": max_tokens,
+              "messages": [{"role": "user", "content": prompt}]}
+    if system:
+        kwargs["system"] = system
+    response = client.messages.create(**kwargs)
+    return "".join(block.text for block in response.content if block.type == "text")
+
 
 # ---------------------------------------------------------------------------
 # 1. Secrets management
@@ -158,8 +210,16 @@ def call_llm_with_schema(
     last_error: Optional[Exception] = None
     for attempt in range(max_retries + 1):
         raw = llm_call()
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            # Strip markdown code fences (```json ... ``` or ``` ... ```) —
+            # models commonly wrap JSON this way even when told not to.
+            cleaned = cleaned.split("```")[1]
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+            cleaned = cleaned.strip()
         try:
-            parsed = json.loads(raw)
+            parsed = json.loads(cleaned)
             if jsonschema is not None:
                 jsonschema.validate(instance=parsed, schema=schema)
             return parsed
@@ -181,7 +241,6 @@ DIAGNOSIS_SCHEMA = {
         "known_issue_ref": {"type": ["string", "null"]},
     },
 }
-
 EVALUATOR_VERDICT_SCHEMA = {
     "type": "object",
     "required": ["sufficient", "missing", "conflicts"],
@@ -189,6 +248,29 @@ EVALUATOR_VERDICT_SCHEMA = {
         "sufficient": {"type": "boolean"},
         "missing": {"type": "array", "items": {"type": "string"}},
         "conflicts": {"type": "array"},
+    },
+}
+
+REASON_OUTPUT_SCHEMA = {
+    "type": "object",
+    "required": ["action"],
+    "properties": {
+        "action": {"enum": ["call_tool", "goal_answered"]},
+        "tool_name": {"type": ["string", "null"]},
+        "tool_args": {"type": "object"},
+        "new_hypothesis": {"type": ["string", "null"]},
+        "evidence_links": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["evidence_id", "hypothesis_id", "relation"],
+                "properties": {
+                    "evidence_id": {"type": "string"},
+                    "hypothesis_id": {"type": "string"},  # may be "NEW" to reference new_hypothesis above
+                    "relation": {"enum": ["supports", "contradicts"]},
+                },
+            },
+        },
     },
 }
 
@@ -207,10 +289,18 @@ class NotificationPayload:
     summary: str
     confidence_band: Optional[str]
     dashboard_url: str
+    notify_teams: Optional[list[str]] = None  # team names from migration_failure_agent_routing.py;
+                                                # None/empty falls back to the single default channel
 
 
 def notify_oncall(payload: NotificationPayload) -> None:
-    """Dispatch to your on-call channel. Wire this to Slack webhook /
+    """Dispatch to your on-call channel(s). If payload.notify_teams is set,
+    fans out to each team's channel via TEAM_CHANNELS (routing layer) —
+    e.g. a storage-owned diagnosis reaches the Storage channel, not just a
+    single generic on-call, with SRE always included per
+    classify_owning_team's rule. Falls back to one default channel if
+    notify_teams is empty (e.g. the INSUFFICIENT_EVIDENCE/ESCALATED paths
+    before routing has run). Wire this to Slack webhook /
     PagerDuty Events API / whatever you use — do not let this raise and
     take down the run if it fails; log and continue, since a failed
     notification should never roll back an already-completed diagnosis."""

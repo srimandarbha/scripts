@@ -15,15 +15,18 @@ search_known_issues_db / search_product_documentation below.
 """
 
 from typing import TypedDict, Literal, Optional
+import uuid
 from langgraph.graph import StateGraph, END
 
 from migration_failure_agent_production import (
     require_enabled,
     AgentDisabledError,
     concurrency_limiter,
+    call_llm,
     call_llm_with_schema,
     DIAGNOSIS_SCHEMA,
     EVALUATOR_VERDICT_SCHEMA,
+    REASON_OUTPUT_SCHEMA,
     OutputValidationError,
     notify_oncall,
     NotificationPayload,
@@ -32,6 +35,7 @@ from migration_failure_agent_production import (
     hash_prompt,
     record_run_version,
 )
+from migration_failure_agent_tools import TOOLS, get_tool_by_name, dedupe_evidence
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +48,7 @@ class Evidence(TypedDict):
     layer: str                 # control_plane | compute | storage | network | events |
                                 # cluster_health | source | knowledge_docs | known_issues
     reliability_tier: str      # LIVE_TELEMETRY | CURRENT_HEALTH_API | LOGS |
-                                # CONFIRMED_FIX | HISTORICAL_RAG
+                                # CONFIRMED_FIX | VENDOR_ADVISORY | HISTORICAL_RAG
     timestamp: str
     claim: str
     supports: list[str]
@@ -57,10 +61,13 @@ class AgentState(TypedDict):
     trigger_payload: dict
     goal: str                         # set by goal_builder
     evidence: list[Evidence]
-    hypotheses: list[dict]
+    hypotheses: list[dict]             # [{"hypothesis_id": str, "statement": str}, ...]
     iteration_count: int
-    budget_remaining: dict
+    budget_remaining: dict             # llm_calls, tool_calls, seconds, max_iterations
     unresolved_conflicts: list[dict]
+    conflict_disambiguation_used: bool  # has the one bounded extra call (SKILL.md §7 rule 4) been spent
+    conflict_exhausted: bool            # set when still unresolved after that one call — routing escalates
+    pending_tool_call: Optional[dict]   # set by reason(), consumed by execute_tool()
     sufficiency: Optional[dict]       # last critic verdict, for tracing
     diagnosis: Optional[dict]
 
@@ -72,14 +79,31 @@ ALLOWED_TRANSITIONS = {
                    "INSUFFICIENT_EVIDENCE", "DIAGNOSIS_READY"},
     "CONFLICTING_EVIDENCE": {"GATHERING_EVIDENCE", "ESCALATED"},
     "DIAGNOSIS_READY": {"COMPOSING", "COMPLETED"},
-    "COMPOSING": {"COMPLETED"},
+    "COMPOSING": {"COMPLETED", "INSUFFICIENT_EVIDENCE"},  # a compose-time output-validation
+                                                            # failure must be able to fail closed
     "INSUFFICIENT_EVIDENCE": {"COMPLETED"},
     "ESCALATED": {"COMPLETED"},
 }
 
 
 def validate_transition(current: str, proposed: str) -> bool:
-    return proposed in ALLOWED_TRANSITIONS.get(current, set())
+    return current == proposed or proposed in ALLOWED_TRANSITIONS.get(current, set())
+
+
+def transition(state: AgentState, target: str, incident_id_field: str = "incident_id") -> AgentState:
+    """The single place any node should change status. Replaces every
+    direct `state["status"] = ...` assignment that used to bypass
+    validation entirely (goal_builder, execute_tool, update_evidence,
+    compose_diagnosis all did this before — only route_after_evaluate ever
+    actually validated). An invalid transition is logged and refused —
+    state stays where it was rather than silently violating the state
+    machine, and the caller's routing logic is responsible for then
+    deciding what happens next."""
+    if not validate_transition(state["status"], target):
+        audit_log(state[incident_id_field], "invalid_transition_attempted",
+                  {"from": state["status"], "to": target})
+        return state
+    return {**state, "status": target}
 
 
 # ---------------------------------------------------------------------------
@@ -189,12 +213,14 @@ def check_budget(state: AgentState) -> bool:
 
 def compute_confidence(evidence: list[Evidence]) -> tuple[float, str]:
     weight = {"LIVE_TELEMETRY": 1.0, "CURRENT_HEALTH_API": 0.8, "LOGS": 0.6,
-              "CONFIRMED_FIX": 0.5, "HISTORICAL_RAG": 0.3}
+              "CONFIRMED_FIX": 0.5, "VENDOR_ADVISORY": 0.45, "HISTORICAL_RAG": 0.3}
     contradicting = sum(1 for e in evidence if e["contradicts"])
     score = sum(weight.get(e["reliability_tier"], 0.2) for e in evidence if e["supports"])
     score = max(0.0, min(1.0, score / max(1, len(evidence)) - 0.3 * contradicting))
-    # A diagnosis resting only on CONFIRMED_FIX/HISTORICAL_RAG evidence is capped at MEDIUM,
-    # even if the raw score would clear HIGH — live-layer corroboration is required for HIGH.
+    # A diagnosis resting only on CONFIRMED_FIX/VENDOR_ADVISORY/HISTORICAL_RAG evidence is
+    # capped at MEDIUM, even if the raw score would clear HIGH — live-layer corroboration
+    # is required for HIGH (a vendor errata or tracker match is a strong lead, not proof
+    # this environment is actually affected).
     live_layers = {"LIVE_TELEMETRY", "CURRENT_HEALTH_API", "LOGS"}
     has_live_support = any(e["reliability_tier"] in live_layers and e["supports"] for e in evidence)
     band = "HIGH" if (score > 0.75 and has_live_support) else "MEDIUM" if score >= 0.40 else "LOW"
@@ -224,16 +250,65 @@ def build_symptom_fingerprint(state: AgentState) -> str:
     return f"{p.get('phase')}::{p.get('error_code')}::{p.get('layer', 'unknown')}"
 
 
+def apply_evidence_links(evidence: list[Evidence], links: list[dict]) -> list[Evidence]:
+    """Writes the LLM's proposed supports/contradicts links onto the actual
+    Evidence objects. THIS WAS MISSING ENTIRELY before this fix — reason()
+    could propose links but nothing ever applied them, so every evidence
+    item's supports/contradicts stayed permanently empty, which meant
+    compute_confidence always scored 0.0 regardless of how much real
+    evidence existed. Called from reason() every iteration with whatever
+    links that turn's LLM output proposed."""
+    by_id = {e["evidence_id"]: e for e in evidence}
+    for link in links:
+        e = by_id.get(link.get("evidence_id"))
+        if e is None:
+            continue
+        target_list = "supports" if link.get("relation") == "supports" else "contradicts"
+        hyp_id = link.get("hypothesis_id")
+        if hyp_id and hyp_id not in e[target_list]:
+            e[target_list].append(hyp_id)
+    return evidence
+
+
+def summarize_hypotheses(hypotheses: list[dict]) -> str:
+    return "\n".join(f"- [{h['hypothesis_id']}] {h['statement']}" for h in hypotheses) or "(none yet)"
+
+
 def has_corroborating_match(evidence: list[Evidence]) -> bool:
     """True only if a tracker/docs hit is backed by >=1 live-layer item that
     also supports the same hypothesis. This is the actual gate on whether a
-    CONFIRMED_FIX/HISTORICAL_RAG match is allowed to influence confidence —
-    see compute_confidence, which enforces the same rule for the score."""
+    CONFIRMED_FIX/VENDOR_ADVISORY/HISTORICAL_RAG match is allowed to
+    influence confidence — see compute_confidence, which enforces the same
+    rule for the score."""
     live_layers = {"LIVE_TELEMETRY", "CURRENT_HEALTH_API", "LOGS"}
-    advisory = {"CONFIRMED_FIX", "HISTORICAL_RAG"}
+    advisory = {"CONFIRMED_FIX", "VENDOR_ADVISORY", "HISTORICAL_RAG"}
     has_advisory = any(e["reliability_tier"] in advisory for e in evidence)
     has_live = any(e["reliability_tier"] in live_layers and e["supports"] for e in evidence)
     return has_advisory and has_live
+
+
+def resolve_conflict(evidence_a: Evidence, evidence_b: Evidence) -> Optional[str]:
+    """Deterministic tie-break per SKILL.md §7: reliability tier -> recency
+    -> corroboration count. Returns the winning evidence_id, or None if
+    still unresolved (caller then spends the one bounded disambiguation
+    call, or escalates). NOTE: this function existed in the original
+    scaffold and was dropped in a later rewrite — re-added here so the
+    conflict-resolution behavior documented in SKILL.md §7 actually runs;
+    without it, `unresolved_conflicts` was only ever checked, never
+    resolved."""
+    tier_rank = {
+        "LIVE_TELEMETRY": 5, "CURRENT_HEALTH_API": 4, "LOGS": 3,
+        "CONFIRMED_FIX": 2, "VENDOR_ADVISORY": 1, "HISTORICAL_RAG": 0,
+    }
+    ra = tier_rank.get(evidence_a["reliability_tier"], -1)
+    rb = tier_rank.get(evidence_b["reliability_tier"], -1)
+    if ra != rb:
+        return evidence_a["evidence_id"] if ra > rb else evidence_b["evidence_id"]
+    if evidence_a["timestamp"] != evidence_b["timestamp"]:
+        return evidence_a["evidence_id"] if evidence_a["timestamp"] > evidence_b["timestamp"] else evidence_b["evidence_id"]
+    if len(evidence_a["supports"]) != len(evidence_b["supports"]):
+        return evidence_a["evidence_id"] if len(evidence_a["supports"]) > len(evidence_b["supports"]) else evidence_b["evidence_id"]
+    return None
 
 
 def audit_log(incident_id: str, event: str, payload: dict) -> None:
@@ -241,40 +316,13 @@ def audit_log(incident_id: str, event: str, payload: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tools (stubs) — SRE tracker DB, known-issues docs, and documentation kept
-# as three separate tools. Never merge them into one index — see docstrings
-# for the trust distinction between a confirmed fix and general explanation.
+# Tools come from migration_failure_agent_tools.TOOLS (imported above) — the
+# full 20-tool catalog, not a local duplicate. This file no longer defines
+# its own tool stubs: an earlier version of this file predated
+# migration_failure_agent_tools.py and left two leftover stub copies here,
+# which meant reason() was only ever bound 2 tools regardless of what
+# tools.py actually contained. Fixed by importing TOOLS directly.
 # ---------------------------------------------------------------------------
-
-def search_sre_tracker_db(fingerprint: str) -> list[Evidence]:
-    """Query the SRE tracker's confirmed-fix table (sre_tracker_fixes) by
-    symptom fingerprint. Use this FIRST among the advisory tools — a
-    confirmed prior fix is the strongest non-live signal you have. Returns
-    only confirmed=true rows. Tag reliability_tier=CONFIRMED_FIX and include
-    fix_id/ticket_ref in the claim. An empty result is a normal, common
-    outcome — it means no team member has confirmed-fixed this exact
-    fingerprint before, not that something is wrong. Continue the
-    investigation using live-layer tools; do not treat an empty result as
-    inconclusive on its own."""
-    ...
-
-
-def search_product_documentation(query: str) -> list[Evidence]:
-    """Use for general explanation of an error code or component behavior
-    from RHOKP articles / MTV / OCV / OCP docs. Weaker signal than
-    search_sre_tracker_db — tag reliability_tier=HISTORICAL_RAG. Does not
-    confirm a fix was applied for this exact symptom before. An empty result
-    is also normal — fall back to live-layer evidence only."""
-    ...
-
-
-TOOLS = [
-    # control plane / compute / storage / cluster-health / events / source —
-    # existing Splunk-backed + K8s API tools registered here, each with a
-    # docstring following the same when/what/boundary pattern.
-    search_sre_tracker_db,
-    search_product_documentation,
-]
 
 
 # ---------------------------------------------------------------------------
@@ -282,46 +330,133 @@ TOOLS = [
 # ---------------------------------------------------------------------------
 
 def goal_builder(state: AgentState) -> AgentState:
-    # llm.invoke(GOAL_BUILDER_PROMPT.format(trigger_payload=state["trigger_payload"]))
-    goal_text = "..."  # LLM output, no tools bound for this call
+    prompt = GOAL_BUILDER_PROMPT.format(trigger_payload=state["trigger_payload"])
+    try:
+        goal_text = call_llm(prompt)
+    except Exception as exc:  # noqa: BLE001 — fail closed to a generic goal, never crash the run
+        audit_log(state["incident_id"], "goal_builder_llm_error", {"error": str(exc)})
+        p = state["trigger_payload"]
+        goal_text = (f"Investigate why migration {p.get('migration_id')} failed at "
+                     f"phase {p.get('phase')} with error {p.get('error_code')}. "
+                     f"No prioritized layer available — goal_builder LLM call failed.")
     state["budget_remaining"]["llm_calls"] -= 1
     audit_log(state["incident_id"], "goal_builder", {"goal": goal_text})
-    return {**state, "goal": goal_text, "status": "GATHERING_EVIDENCE"}
+    state = {
+        **state,
+        "goal": goal_text,
+        "hypotheses": state.get("hypotheses", []),
+        "iteration_count": state.get("iteration_count", 0),
+        "unresolved_conflicts": state.get("unresolved_conflicts", []),
+        "conflict_disambiguation_used": state.get("conflict_disambiguation_used", False),
+        "conflict_exhausted": state.get("conflict_exhausted", False),
+        "pending_tool_call": None,
+    }
+    return transition(state, "GATHERING_EVIDENCE")
 
 
 def reason(state: AgentState) -> AgentState:
+    state["iteration_count"] = state.get("iteration_count", 0) + 1
     prompt = REASON_SYSTEM_PROMPT.format(
         goal=state["goal"],
         evidence_summary=summarize_evidence(state["evidence"]),
-    )
-    # llm_with_tools = llm.bind_tools(TOOLS)
-    # response = llm_with_tools.invoke(prompt)  -> proposed tool call
+    ) + f"\n\nCurrent hypotheses:\n{summarize_hypotheses(state['hypotheses'])}"
+
+    try:
+        output = call_llm_with_schema(
+            llm_call=lambda: call_llm(prompt),
+            schema=REASON_OUTPUT_SCHEMA,
+        )
+    except OutputValidationError:
+        # Malformed proposal — stop proposing new tool calls this run and let
+        # evaluate_goal judge sufficiency on whatever evidence already exists,
+        # rather than looping on repeatedly-invalid output.
+        output = {"action": "goal_answered", "evidence_links": [], "new_hypothesis": None}
+
     state["budget_remaining"]["llm_calls"] -= 1
-    audit_log(state["incident_id"], "reason", {})
+
+    if output.get("new_hypothesis"):
+        hyp_id = str(uuid.uuid4())
+        state["hypotheses"] = [*state["hypotheses"], {"hypothesis_id": hyp_id, "statement": output["new_hypothesis"]}]
+        # Resolve a "NEW" placeholder in this turn's links to the hypothesis just created,
+        # since the model can't know the generated UUID ahead of time.
+        for link in output.get("evidence_links", []):
+            if link.get("hypothesis_id") == "NEW":
+                link["hypothesis_id"] = hyp_id
+
+    state["evidence"] = apply_evidence_links(state["evidence"], output.get("evidence_links", []))
+
+    state["pending_tool_call"] = (
+        {"tool_name": output["tool_name"], "tool_args": output.get("tool_args", {})}
+        if output.get("action") == "call_tool" and output.get("tool_name")
+        else None
+    )
+    audit_log(state["incident_id"], "reason", {"action": output.get("action"),
+                                                "tool": output.get("tool_name")})
     return state
 
 
 def execute_tool(state: AgentState) -> AgentState:
-    if not check_budget(state):
-        return {**state, "status": "EVALUATING"}
-    # Dispatch the tool `reason` proposed, via the READ_ONLY-enforced registry.
+    if not state.get("pending_tool_call") or not check_budget(state):
+        return transition(state, "EVALUATING")
+
+    tool_name = state["pending_tool_call"]["tool_name"]
+    tool_fn = get_tool_by_name(tool_name)
     state["budget_remaining"]["tool_calls"] -= 1
-    audit_log(state["incident_id"], "execute_tool", {})
+
+    if tool_fn is None:
+        audit_log(state["incident_id"], "unknown_tool_requested", {"tool_name": tool_name})
+        return state
+
+    try:
+        new_evidence = tool_fn(**state["pending_tool_call"].get("tool_args", {}))
+    except Exception as exc:  # noqa: BLE001 — read_only_tool already fail-softs; this is defense in depth
+        audit_log(state["incident_id"], "tool_execution_error", {"tool": tool_name, "error": str(exc)})
+        new_evidence = []
+
+    state["evidence"] = [*state["evidence"], *new_evidence]
+    audit_log(state["incident_id"], "execute_tool", {"tool": tool_name, "evidence_added": len(new_evidence)})
     return state
 
 
 def update_evidence(state: AgentState) -> AgentState:
-    new_evidence = state["evidence"]  # populated by execute_tool in a real impl
-    for e in new_evidence:
-        e["claim"] = sanitize_retrieved_text(e["claim"])
-    return {**state, "evidence": new_evidence, "status": "EVALUATING"}
+    state["evidence"] = dedupe_evidence(state["evidence"])
+    return transition(state, "EVALUATING")
 
 
 def evaluate_goal(state: AgentState) -> AgentState:
+    # Step 0: ALWAYS re-attempt resolution on any currently-unresolved
+    # conflicts first, using whatever evidence exists now (including
+    # anything gathered in the loop iteration that just completed). This
+    # used to short-circuit before ever reaching resolve_conflict() again
+    # once a conflict was flagged, which meant a conflict could never
+    # actually be resolved even after a targeted disambiguation call — fixed
+    # by running the resolution attempt every time, not just once.
+    if state.get("unresolved_conflicts"):
+        evidence_by_id = {e["evidence_id"]: e for e in state["evidence"]}
+        still_unresolved = []
+        for c in state["unresolved_conflicts"]:
+            ev_a = evidence_by_id.get(c["evidence_id_a"])
+            ev_b = evidence_by_id.get(c["evidence_id_b"])
+            winner = resolve_conflict(ev_a, ev_b) if ev_a and ev_b else None
+            if winner is None:
+                still_unresolved.append(c)
+            else:
+                audit_log(state["incident_id"], "conflict_resolved", {"winner": winner, **c})
+        state["unresolved_conflicts"] = still_unresolved
+
+        if state["unresolved_conflicts"]:
+            # Still stuck. SKILL.md §7 rule 4 allows exactly ONE additional
+            # targeted disambiguation call — enforce that with a counter
+            # rather than looping until the overall budget runs out.
+            if state.get("conflict_disambiguation_used"):
+                state["conflict_exhausted"] = True  # routing escalates on this
+            else:
+                state["conflict_disambiguation_used"] = True  # one more loop back to reason
+            return state
+        # else: everything resolved — fall through to normal evaluation below.
+
     # Stage 1: deterministic checks — skip the LLM call entirely if these resolve it.
     score, band = compute_confidence(state["evidence"])
-    if state["unresolved_conflicts"]:
-        return state  # routing handles conflict path, no critic call needed
     if not check_budget(state) and band == "LOW":
         return state  # routing sends this to INSUFFICIENT_EVIDENCE, no critic call needed
 
@@ -341,13 +476,30 @@ def evaluate_goal(state: AgentState) -> AgentState:
         verdict = {"sufficient": False, "missing": ["evaluator produced invalid output"], "conflicts": []}
     state["budget_remaining"]["llm_calls"] -= 1
     state["sufficiency"] = verdict
-    if verdict["sufficient"]:
+
+    # New conflicts the critic just flagged (distinct from ones already
+    # tracked above) get one resolution attempt immediately too.
+    if verdict["conflicts"]:
+        evidence_by_id = {e["evidence_id"]: e for e in state["evidence"]}
+        newly_unresolved = []
+        for c in verdict["conflicts"]:
+            ev_a = evidence_by_id.get(c["evidence_id_a"])
+            ev_b = evidence_by_id.get(c["evidence_id_b"])
+            winner = resolve_conflict(ev_a, ev_b) if ev_a and ev_b else None
+            if winner is None:
+                newly_unresolved.append(c)
+            else:
+                audit_log(state["incident_id"], "conflict_resolved", {"winner": winner, **c})
+        state["unresolved_conflicts"] = newly_unresolved
+
+    if verdict["sufficient"] and not state["unresolved_conflicts"]:
         state["diagnosis"] = {"confidence_band": band, "confidence_score": score}
     audit_log(state["incident_id"], "evaluate_goal", verdict)
     return state
 
 
 def compose_diagnosis(state: AgentState) -> AgentState:
+    state = transition(state, "COMPOSING")
     prompt = COMPOSE_DIAGNOSIS_PROMPT.format(
         goal=state["goal"],
         evidence_summary=summarize_evidence(state["evidence"]),
@@ -360,14 +512,32 @@ def compose_diagnosis(state: AgentState) -> AgentState:
         )
     except OutputValidationError:
         # Cannot produce a valid diagnosis — fail closed to INSUFFICIENT_EVIDENCE
-        # rather than surfacing unvalidated text as a root cause.
-        return {**state, "status": "INSUFFICIENT_EVIDENCE",
-                "diagnosis": None,
-                "sufficiency": {"sufficient": False,
-                                 "missing": ["compose_diagnosis produced invalid output"],
-                                 "conflicts": []}}
+        # rather than surfacing unvalidated text as a root cause. COMPOSING ->
+        # INSUFFICIENT_EVIDENCE is now an allowed transition specifically for
+        # this path (it wasn't before, so this used to be an unvalidated,
+        # undocumented state jump).
+        return transition({**state,
+                            "diagnosis": None,
+                            "sufficiency": {"sufficient": False,
+                                             "missing": ["compose_diagnosis produced invalid output"],
+                                             "conflicts": []}},
+                           "INSUFFICIENT_EVIDENCE")
+
     state["budget_remaining"]["llm_calls"] -= 1
     state["diagnosis"] = {**state["diagnosis"], **output}
+
+    # Team routing — deterministic, computed from evidence_refs, not an
+    # LLM judgment. See migration_failure_agent_routing.py.
+    from migration_failure_agent_routing import classify_owning_team, feed_testops_readiness_signal
+    owning_team, notify_teams, rationale = classify_owning_team(state["diagnosis"], state["evidence"])
+    state["diagnosis"]["owning_team"] = owning_team
+    state["diagnosis"]["notify_teams"] = notify_teams
+    state["diagnosis"]["routing_rationale"] = rationale
+    try:
+        feed_testops_readiness_signal(state["diagnosis"], is_cluster_wide=bool(state.get("correlation_group_id")))
+    except Exception as exc:  # noqa: BLE001 — never let a feedback signal break the run
+        audit_log(state["incident_id"], "testops_signal_failed", {"error": str(exc)})
+
     audit_log(state["incident_id"], "compose_diagnosis", output)
 
     notify_oncall(NotificationPayload(
@@ -377,7 +547,22 @@ def compose_diagnosis(state: AgentState) -> AgentState:
         confidence_band=state["diagnosis"].get("confidence_band"),
         dashboard_url=f"https://portal.internal/incidents/{state['incident_id']}",
     ))
-    return {**state, "status": "COMPLETED"}
+
+    # Action drafting runs off a separate budget, but it still executes
+    # synchronously within this node — wrap it so a drafting failure can
+    # never take down an otherwise-successful diagnosis. This was missing
+    # before: an uncaught exception here would have crashed the whole run.
+    try:
+        from migration_failure_agent_actions import draft_action_suggestion
+        draft_action_suggestion(
+            incident_id=state["incident_id"],
+            diagnosis=state["diagnosis"],
+            evidence_summary=summarize_evidence(state["evidence"]),
+        )
+    except Exception as exc:  # noqa: BLE001
+        audit_log(state["incident_id"], "action_drafting_failed", {"error": str(exc)})
+
+    return transition(state, "COMPLETED")
 
 
 # ---------------------------------------------------------------------------
@@ -387,8 +572,13 @@ def compose_diagnosis(state: AgentState) -> AgentState:
 def route_after_evaluate(state: AgentState) -> Literal[
     "reason", "compose_diagnosis", "insufficient_evidence", "escalated"
 ]:
-    if state["unresolved_conflicts"]:
-        proposed, target = ("escalated", "ESCALATED") if not check_budget(state) \
+    if state.get("unresolved_conflicts"):
+        # Escalate only once the one bounded disambiguation call has been
+        # used and STILL didn't resolve it (conflict_exhausted, set in
+        # evaluate_goal) — not simply whenever budget happens to run out,
+        # which used to allow unbounded looping instead of the documented
+        # "exactly one extra call" rule.
+        proposed, target = ("escalated", "ESCALATED") if state.get("conflict_exhausted") \
             else ("reason", "GATHERING_EVIDENCE")
     elif state.get("diagnosis") is not None:
         proposed, target = "compose_diagnosis", "DIAGNOSIS_READY"
@@ -398,6 +588,8 @@ def route_after_evaluate(state: AgentState) -> Literal[
         proposed, target = "reason", "GATHERING_EVIDENCE"
 
     if not validate_transition(state["status"], target):
+        audit_log(state["incident_id"], "invalid_transition_attempted",
+                  {"from": state["status"], "to": target})
         return "insufficient_evidence"  # fail closed on an invalid transition
 
     state["status"] = target
@@ -467,12 +659,47 @@ def run_agent(initial_state: AgentState) -> AgentState:
         audit_log(incident_id, "run_agent", {"skipped": "kill_switch_disabled"})
         return {**initial_state, "status": "NEW"}  # left for manual triage, not silently dropped
 
+    # Cluster-wide correlation check — BEFORE the graph runs at all. See
+    # migration_failure_agent_correlation.py. Requires cluster_id in the
+    # trigger payload; skip this block entirely if that's not populated.
+    from migration_failure_agent_correlation import (
+        find_or_create_correlation_group, attach_to_existing_diagnosis, build_burst_evidence,
+    )
+    cluster_id = initial_state["trigger_payload"].get("cluster_id")
+    group = None
+    if cluster_id:
+        group, is_representative = find_or_create_correlation_group(incident_id, cluster_id)
+        if not is_representative and group.representative_diagnosis:
+            result = attach_to_existing_diagnosis(incident_id, group)
+            if result["short_circuited"]:
+                audit_log(incident_id, "run_agent", {"short_circuited_via_correlation": group.group_id})
+                # Normalize to the SAME diagnosis shape compose_diagnosis produces
+                # (root_cause/confidence_band/evidence_refs/recommended_action/
+                # known_issue_ref) — previously this returned the whole helper
+                # result including short_circuited/status/incident_id nested
+                # inside "diagnosis", which downstream code expecting the
+                # standard shape would have broken on.
+                clean_diagnosis = {k: result[k] for k in
+                                    ("root_cause", "confidence_band", "evidence_refs",
+                                     "recommended_action", "known_issue_ref")
+                                    if k in result}
+                clean_diagnosis["correlated_with"] = result.get("correlated_with")
+                return {**initial_state, "status": "COMPLETED", "diagnosis": clean_diagnosis}
+            # else: symptom wasn't actually consistent — fall through to a normal run
+
     record_run_version(incident_id, prompt_hashes={
         "goal_builder": hash_prompt(GOAL_BUILDER_PROMPT),
         "reason": hash_prompt(REASON_SYSTEM_PROMPT),
         "evaluator": hash_prompt(EVALUATOR_CRITIC_PROMPT),
         "compose_diagnosis": hash_prompt(COMPOSE_DIAGNOSIS_PROMPT),
     })
+
+    # Seed burst evidence for the representative of a real burst, so the
+    # first goal_builder call already knows this may be cluster-wide.
+    if group:
+        burst_evidence = build_burst_evidence(group)
+        if burst_evidence:
+            initial_state["evidence"] = [*initial_state.get("evidence", []), burst_evidence]
 
     with concurrency_limiter.acquire(incident_id):
         app = _get_compiled_graph()
@@ -487,6 +714,11 @@ def run_agent(initial_state: AgentState) -> AgentState:
             confidence_band=None,
             dashboard_url=f"https://portal.internal/incidents/{incident_id}",
         ))
+
+    # Broadcast to siblings if this run was a group representative that just concluded.
+    if group and final_state["status"] == "COMPLETED" and final_state.get("diagnosis"):
+        from migration_failure_agent_correlation import broadcast_diagnosis_to_group
+        broadcast_diagnosis_to_group(incident_id, final_state["diagnosis"])
 
     return final_state
 

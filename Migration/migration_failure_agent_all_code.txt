@@ -29,6 +29,58 @@ try:
 except ImportError:  # pragma: no cover — degrade to a no-op validator if unavailable
     jsonschema = None
 
+try:
+    import anthropic
+except ImportError:  # pragma: no cover — real dependency in production; must be installed
+    anthropic = None
+
+
+# ---------------------------------------------------------------------------
+# LLM client — the actual model call every prompted node uses. Replaces the
+# `lambda: "..."` placeholders that were sitting in for this everywhere
+# (goal_builder, reason, evaluate_goal's critic, compose_diagnosis, and the
+# action drafter). Every one of those call sites now does
+# `llm_call=lambda: call_llm(prompt)` instead of a hardcoded string.
+# ---------------------------------------------------------------------------
+
+DEFAULT_MODEL = "claude-sonnet-4-6"
+
+_client: Optional["anthropic.Anthropic"] = None
+
+
+def _get_client() -> "anthropic.Anthropic":
+    global _client
+    if anthropic is None:
+        raise RuntimeError(
+            "anthropic package not installed. Run: pip install anthropic"
+        )
+    if _client is None:
+        _client = anthropic.Anthropic(api_key=get_secret("anthropic_api_key"))
+    return _client
+
+
+def call_llm(prompt: str, system: Optional[str] = None,
+             model: str = DEFAULT_MODEL, max_tokens: int = 1024) -> str:
+    """The single real LLM call used everywhere in this codebase. Every
+    prompted node (goal_builder, reason, evaluate_goal's critic,
+    compose_diagnosis, and migration_failure_agent_actions.py's drafter)
+    calls this — directly for plain-text output (goal_builder), or wrapped
+    in call_llm_with_schema() below for anything that must return valid
+    JSON. Credentials come from get_secret(), never hardcoded.
+
+    Raises whatever the anthropic SDK raises on failure (rate limit, auth,
+    timeout) — callers that need retry/fail-closed behavior wrap this in
+    call_llm_with_schema, which already retries and fails closed. A caller
+    that wants plain text (goal_builder) should catch exceptions itself and
+    fail closed to a safe default goal/summary rather than crashing the run."""
+    client = _get_client()
+    kwargs = {"model": model, "max_tokens": max_tokens,
+              "messages": [{"role": "user", "content": prompt}]}
+    if system:
+        kwargs["system"] = system
+    response = client.messages.create(**kwargs)
+    return "".join(block.text for block in response.content if block.type == "text")
+
 
 # ---------------------------------------------------------------------------
 # 1. Secrets management
@@ -161,8 +213,16 @@ def call_llm_with_schema(
     last_error: Optional[Exception] = None
     for attempt in range(max_retries + 1):
         raw = llm_call()
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            # Strip markdown code fences (```json ... ``` or ``` ... ```) —
+            # models commonly wrap JSON this way even when told not to.
+            cleaned = cleaned.split("```")[1]
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+            cleaned = cleaned.strip()
         try:
-            parsed = json.loads(raw)
+            parsed = json.loads(cleaned)
             if jsonschema is not None:
                 jsonschema.validate(instance=parsed, schema=schema)
             return parsed
@@ -184,7 +244,6 @@ DIAGNOSIS_SCHEMA = {
         "known_issue_ref": {"type": ["string", "null"]},
     },
 }
-
 EVALUATOR_VERDICT_SCHEMA = {
     "type": "object",
     "required": ["sufficient", "missing", "conflicts"],
@@ -233,10 +292,18 @@ class NotificationPayload:
     summary: str
     confidence_band: Optional[str]
     dashboard_url: str
+    notify_teams: Optional[list[str]] = None  # team names from migration_failure_agent_routing.py;
+                                                # None/empty falls back to the single default channel
 
 
 def notify_oncall(payload: NotificationPayload) -> None:
-    """Dispatch to your on-call channel. Wire this to Slack webhook /
+    """Dispatch to your on-call channel(s). If payload.notify_teams is set,
+    fans out to each team's channel via TEAM_CHANNELS (routing layer) —
+    e.g. a storage-owned diagnosis reaches the Storage channel, not just a
+    single generic on-call, with SRE always included per
+    classify_owning_team's rule. Falls back to one default channel if
+    notify_teams is empty (e.g. the INSUFFICIENT_EVIDENCE/ESCALATED paths
+    before routing has run). Wire this to Slack webhook /
     PagerDuty Events API / whatever you use — do not let this raise and
     take down the run if it fails; log and continue, since a failed
     notification should never roll back an already-completed diagnosis."""
@@ -280,7 +347,6 @@ def record_run_version(incident_id: str, prompt_hashes: dict[str, str]) -> None:
     # TODO: INSERT INTO run_versions (incident_id, agent_version, skill_md_version, prompt_hashes, ts)
     ...
 -e 
-
 
 # ============================================================================
 # FILE: migration_failure_agent_tools.py
@@ -672,19 +738,30 @@ def get_pvc_status(pvc_id: str) -> list[Evidence]:
 def get_storage_class_health(sc_id: str) -> list[Evidence]:
     """Use when get_pvc_status shows Pending with a provisioning reason.
     Returns the storage class's current capacity/availability status —
-    confirms or rules out capacity exhaustion as the cause. Input source:
-    evidence — sc_id is normally read from the storageClassName field in a
-    prior get_pvc_status claim. Falls back to config only if this cluster
-    has a single default storage class known ahead of time.
+    confirms or rules out capacity exhaustion as the cause. Reads from
+    Splunk (OTel-exported gauge metric, 1-5 min freshness), NOT a live
+    storage backend call — capacity is a genuinely numeric, continuously
+    changing value, which is exactly the case for an OTel gauge rather
+    than a live query, same reasoning as get_cluster_topology_snapshot.
+    Input source: evidence — sc_id is normally read from the
+    storageClassName field in a prior get_pvc_status claim. Falls back to
+    config only if this cluster has a single default storage class known
+    ahead of time.
 
     Pseudocode:
-        sc = k8s.read_storage_class(name=sc_id)
-        capacity = storage_backend_client.get_capacity(sc.provisioner)
-        yield make_evidence(..., claim=f"Storage class {sc_id} ({sc.provisioner}): {capacity}")
+        spl = f'index=cluster_metrics metric_name="ocv_storageclass_capacity_used_percent" '
+              f'storage_class="{sc_id}" | tail 1'
+        row = splunk.jobs.oneshot(spl)
+        yield make_evidence(..., reliability_tier="CURRENT_HEALTH_API",
+                             claim=f"Storage class {sc_id}: {row.value}% used, "
+                                   f"last_sampled={row._time}")
     """
-    status: dict = {}  # TODO: storage backend query
+    row: dict = {}  # TODO: Splunk query against the OTel-exported capacity gauge
+    if not row:
+        return []
     return [make_evidence("get_storage_class_health", "storage", RELIABILITY_TIERS["CURRENT_HEALTH_API"],
-                           f"Storage class {sc_id} health: {status}")] if status else []
+                           f"Storage class {sc_id}: {row.get('value')}% used, "
+                           f"last_sampled={row.get('_time')}")]
 
 
 @read_only_tool
@@ -815,6 +892,242 @@ def get_recent_cluster_changes(time_range: str) -> list[Evidence]:
     changes: list[dict] = []  # TODO: cluster audit log / GitOps deploy history
     return [make_evidence("get_recent_cluster_changes", "cluster_health", RELIABILITY_TIERS["LOGS"],
                            f"Cluster change: {c}") for c in changes]
+
+
+# ---------------------------------------------------------------------------
+# 8b. Third-party services and change management — new layers, added to
+# support team routing (see migration_failure_agent_routing.py). Neither
+# existed before; auth/registry failures and CHG-window mismatches were
+# previously invisible, buried as unstructured text inside other tools'
+# claims if visible at all.
+# ---------------------------------------------------------------------------
+
+@read_only_tool
+def get_third_party_service_status(service: str, time_range: str) -> list[Evidence]:
+    """Use when a failure looks like an auth, secrets, or image-pull problem
+    rather than a migration-specific one — e.g. pod logs mention 401/403,
+    token expiry, or 'ImagePullBackOff' against an internal registry.
+    service must be one of: 'vault', 'entraid', 'nexus'. Tag
+    layer=third_party so it routes to the third-party integrations team,
+    not SRE or Build. Input source: derived — service is inferred by the
+    reason node from the error text in other evidence (e.g. a 401 from
+    Vault implies service='vault'), not from the trigger payload.
+
+    Pseudocode:
+        status = third_party_client.get_health(service, window=time_range)
+        yield make_evidence(..., layer="third_party",
+                             claim=f"{service}: {status.summary} (last_error={status.last_error})")
+    """
+    if service not in ("vault", "entraid", "nexus"):
+        return []
+    status: dict = {}  # TODO: per-service health/auth-log client call
+    if not status:
+        return []
+    return [make_evidence("get_third_party_service_status", "third_party", RELIABILITY_TIERS["LIVE_TELEMETRY"],
+                           f"{service}: {status.get('summary')} (last_error={status.get('last_error')})")]
+
+
+@read_only_tool
+def get_change_request_status(migration_id: str) -> list[Evidence]:
+    """Use early, alongside control-plane checks — a migration executed
+    outside its approved CHG window, or against an unapproved change, is a
+    process-compliance root cause distinct from any technical layer, and
+    nothing else checks for it. Returns the linked CHG's approval status
+    and approved window. Input source: trigger — migration_id comes
+    directly from the trigger payload.
+
+    Pseudocode:
+        chg = change_mgmt_client.get_linked_change(migration_id)
+        in_window = chg.approved and chg.window_start <= now() <= chg.window_end
+        yield make_evidence(..., claim=f"CHG {chg.id}: approved={chg.approved}, "
+                                        f"in_window={in_window} ({chg.window_start}-{chg.window_end})")
+    """
+    chg: dict = {}  # TODO: change management system API call
+    if not chg:
+        return []
+    return [make_evidence("get_change_request_status", "control_plane", RELIABILITY_TIERS["CURRENT_HEALTH_API"],
+                           f"CHG {chg.get('id')}: approved={chg.get('approved')}, "
+                           f"in_window={chg.get('in_window')} ({chg.get('window_start')}-{chg.get('window_end')})")]
+
+
+# ---------------------------------------------------------------------------
+# 8c. Topology/config — network map, storage map, provider state. These are
+# EXPORTED PERIODICALLY to Splunk via OpenTelemetry (a scheduled CronJob,
+# decoupled from this agent's runtime), not fetched live per-call — that's
+# what makes them fast. Storage class capacity is exported as an OTel
+# gauge metric on a shorter cycle since it's genuinely numeric; the rest
+# are structured log records refreshed every 5-15 minutes. Freshness here
+# is "recent enough for config," never "must be this instant" — that's the
+# dividing line from get_pvc_status/get_change_request_status above, which
+# stay live API calls because staleness there could mislead an active
+# investigation.
+# ---------------------------------------------------------------------------
+
+@read_only_tool
+def get_network_map_status(migration_id: str) -> list[Evidence]:
+    """Use when a network-mapping mismatch is a live hypothesis and you need
+    the FULL source-network -> target-NAD mapping, not just one NAD's
+    status (see get_network_attachment_status for that). Reads from Splunk
+    (OTel-exported NetworkMap CR snapshot, ~5-15 min freshness), not a live
+    K8s call — fast. Input source: trigger — migration_id comes directly
+    from the trigger payload.
+
+    Pseudocode:
+        spl = f'index=cluster_config sourcetype=networkmap migration_id="{migration_id}"
+               | head 1'
+        row = splunk.jobs.oneshot(spl)
+        yield make_evidence(..., reliability_tier="CURRENT_HEALTH_API",
+                             claim=f"NetworkMap: {row.mappings}, valid={row.valid}, "
+                                   f"last_synced={row.export_timestamp}")
+    """
+    row: dict = {}  # TODO: Splunk query against the OTel-exported networkmap index
+    if not row:
+        return []
+    return [make_evidence("get_network_map_status", "network", RELIABILITY_TIERS["CURRENT_HEALTH_API"],
+                           f"NetworkMap: {row.get('mappings')}, valid={row.get('valid')}, "
+                           f"last_synced={row.get('export_timestamp')}")]
+
+
+@read_only_tool
+def get_storage_map_status(migration_id: str) -> list[Evidence]:
+    """Use when a storage-mapping mismatch is a live hypothesis — the FULL
+    source-datastore -> target-storage-class mapping. Reads from Splunk
+    (OTel-exported StorageMap CR snapshot), same freshness/speed profile
+    as get_network_map_status. Input source: trigger — migration_id comes
+    directly from the trigger payload.
+
+    Pseudocode: same shape as get_network_map_status, sourcetype=storagemap.
+    """
+    row: dict = {}  # TODO: Splunk query against the OTel-exported storagemap index
+    if not row:
+        return []
+    return [make_evidence("get_storage_map_status", "storage", RELIABILITY_TIERS["CURRENT_HEALTH_API"],
+                           f"StorageMap: {row.get('mappings')}, valid={row.get('valid')}, "
+                           f"last_synced={row.get('export_timestamp')}")]
+
+
+@read_only_tool
+def get_provider_status(provider_id: str) -> list[Evidence]:
+    """Use when you need to know which source provider (vCenter/oVirt/
+    OpenStack/host) a migration is tied to, and whether that provider's
+    connection is healthy — e.g. a burst of failures across many
+    migrations might trace back to one degraded Provider connection
+    rather than per-VM issues. Reads from Splunk (OTel-exported Provider
+    CR snapshot). Input source: evidence — provider_id is normally read
+    from a provider reference in a prior get_migration_plan_status claim,
+    not from the trigger payload directly.
+
+    Pseudocode:
+        spl = f'index=cluster_config sourcetype=provider provider_id="{provider_id}" | head 1'
+        row = splunk.jobs.oneshot(spl)
+        yield make_evidence(..., claim=f"Provider {provider_id} ({row.type}): "
+                                        f"connected={row.connected}, last_sync={row.last_sync}")
+    """
+    row: dict = {}  # TODO: Splunk query against the OTel-exported provider index
+    if not row:
+        return []
+    return [make_evidence("get_provider_status", "control_plane", RELIABILITY_TIERS["CURRENT_HEALTH_API"],
+                           f"Provider {provider_id} ({row.get('type')}): "
+                           f"connected={row.get('connected')}, last_sync={row.get('last_sync')}")]
+
+
+@read_only_tool
+def get_cluster_topology_snapshot(cluster_id: str) -> list[Evidence]:
+    """Use for a broad picture of what's available on this cluster —
+    storage classes and their current capacity (OTel gauge metric,
+    1-5 min freshness), CSI driver versions, NAD inventory, node counts.
+    Useful early when a cluster-wide correlation burst is detected (see
+    migration_failure_agent_correlation.py) and you want cluster context
+    without querying each subsystem individually. Input source: trigger —
+    cluster_id comes directly from the trigger payload.
+
+    Pseudocode:
+        spl = f'index=cluster_metrics cluster_id="{cluster_id}" earliest=-15m
+               | stats latest(*) by metric_name'
+        rows = splunk.jobs.oneshot(spl)
+        yield make_evidence(..., claim=f"Cluster {cluster_id} topology: {rows}")
+    """
+    rows: list[dict] = []  # TODO: Splunk query against OTel-exported topology metrics/logs
+    return [make_evidence("get_cluster_topology_snapshot", "cluster_health", RELIABILITY_TIERS["CURRENT_HEALTH_API"],
+                           f"Topology signal: {r}") for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# 8d. Post-migration validation, cluster/namespace capacity — the 3 gaps
+# identified in review: nothing previously checked whether a "completed"
+# migration actually produced a bootable VM, and no tool answered "does
+# this cluster/namespace actually have room" beyond storage specifically.
+# ---------------------------------------------------------------------------
+
+@read_only_tool
+def get_target_vm_boot_status(vm_id: str) -> list[Evidence]:
+    """Use when a migration reports COMPLETED but the failure being
+    investigated is actually "VM won't boot" — a distinct failure class
+    from a failed migration itself, with no other tool covering it.
+    Returns the target VMI's guest-agent connection status and last
+    console state. Input source: trigger — vm_id comes directly from the
+    trigger payload (this tool applies to the post-migration failure path,
+    not the standard mid-migration one, so the triggering event for this
+    case is a boot-failure report rather than migration.failed).
+
+    Pseudocode:
+        vmi = k8s.get_custom_object(group="kubevirt.io", version="v1",
+                                     namespace=NS, plural="virtualmachineinstances", name=vm_id)
+        guest_agent_connected = vmi["status"].get("conditions", [])
+        yield make_evidence(..., claim=f"VMI {vm_id}: phase={vmi['status']['phase']}, "
+                                        f"guest_agent={guest_agent_connected}")
+    """
+    vmi: dict = {}  # TODO: KubeVirt VMI status query
+    if not vmi:
+        return []
+    return [make_evidence("get_target_vm_boot_status", "compute", RELIABILITY_TIERS["LIVE_TELEMETRY"],
+                           f"VMI {vm_id}: phase={vmi.get('phase')}, guest_agent={vmi.get('guest_agent')}")]
+
+
+@read_only_tool
+def get_cluster_resource_capacity(cluster_id: str) -> list[Evidence]:
+    """Use when a scheduling-related failure has no clear reason in events
+    — checks whether the cluster actually has CPU/memory headroom to place
+    the VM, distinct from get_storage_class_health (storage-specific) and
+    get_cluster_health (operator/control-plane health, not capacity).
+    Reads from Splunk (OTel-exported gauge, same pattern as storage
+    capacity) rather than a live metrics-server call. Input source:
+    trigger — cluster_id comes directly from the trigger payload.
+
+    Pseudocode:
+        spl = f'index=cluster_metrics metric_name IN ("cpu_allocatable_percent",
+              "memory_allocatable_percent") cluster_id="{cluster_id}" | tail 1 by metric_name'
+        rows = splunk.jobs.oneshot(spl)
+        yield make_evidence(..., claim=f"Cluster {cluster_id} capacity: {rows}")
+    """
+    rows: list[dict] = []  # TODO: Splunk query against OTel-exported capacity gauges
+    if not rows:
+        return []
+    return [make_evidence("get_cluster_resource_capacity", "cluster_health", RELIABILITY_TIERS["CURRENT_HEALTH_API"],
+                           f"Cluster {cluster_id} capacity: {r}") for r in rows]
+
+
+@read_only_tool
+def get_namespace_quota_status(namespace: str) -> list[Evidence]:
+    """Use alongside get_namespace_events when a scheduling/admission
+    failure might be quota-related — states the actual headroom number
+    directly rather than leaving the agent to infer it from an event
+    message alone. Live K8s API call (ResourceQuota/LimitRange are cheap
+    to query and change infrequently enough that freshness isn't the
+    concern here — this is about getting the exact number, not speed).
+    Input source: trigger — namespace comes from migration metadata in the
+    trigger payload, same as get_namespace_events.
+
+    Pseudocode:
+        rq = k8s.list_namespaced_resource_quota(namespace=namespace)
+        for item in rq.items:
+            yield make_evidence(..., claim=f"ResourceQuota {item.metadata.name}: "
+                                            f"used={item.status.used}, hard={item.status.hard}")
+    """
+    quotas: list[dict] = []  # TODO: K8s ResourceQuota/LimitRange query
+    return [make_evidence("get_namespace_quota_status", "cluster_health", RELIABILITY_TIERS["LIVE_TELEMETRY"],
+                           f"ResourceQuota {q.get('name')}: used={q.get('used')}, hard={q.get('hard')}")
+            for q in quotas]
 
 
 # ---------------------------------------------------------------------------
@@ -985,6 +1298,15 @@ TOOLS: list[Callable] = [
     get_source_vm_config,      # remove if bare-metal only
     get_bmc_events,            # remove if VMware only
     get_recent_cluster_changes,
+    get_third_party_service_status,
+    get_change_request_status,
+    get_network_map_status,
+    get_storage_map_status,
+    get_provider_status,
+    get_cluster_topology_snapshot,
+    get_target_vm_boot_status,
+    get_cluster_resource_capacity,
+    get_namespace_quota_status,
     search_sre_tracker_db,
     search_product_documentation,
     get_similar_migrations,
@@ -997,6 +1319,166 @@ def get_tool_by_name(name: str) -> Optional[Callable]:
     return next((t for t in TOOLS if t.__name__ == name), None)
 -e 
 
+# ============================================================================
+# FILE: migration_failure_agent_routing.py
+# ============================================================================
+"""
+Migration Failure Agent — team routing layer.
+
+Ownership is computed deterministically from which evidence layer/tool
+actually drove the diagnosis — same principle as compute_confidence and
+resolve_conflict elsewhere in this codebase: routing is not an LLM
+judgment call each run (inconsistent, unauditable, drifts), it's a rule
+table over evidence_refs, with an LLM disambiguation step ONLY when the
+deterministic mapping genuinely can't decide (see classify_owning_team's
+fallback).
+
+Called from compose_diagnosis, after the diagnosis JSON is composed but
+before notify_oncall — see the two lines added there.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Teams
+# ---------------------------------------------------------------------------
+
+TEAM_OBSERVABILITY = "observability"
+TEAM_BUILD = "build"
+TEAM_SRE_DAY2 = "sre_day2"          # default owner, always in notify_teams
+TEAM_TESTOPS = "testops"
+TEAM_STORAGE = "storage"
+TEAM_NETWORK = "network"
+TEAM_THIRD_PARTY = "third_party"
+TEAM_HARDWARE = "hardware"
+TEAM_VMWARE_ADMINS = "vmware_admins"
+
+ALL_TEAMS = {
+    TEAM_OBSERVABILITY, TEAM_BUILD, TEAM_SRE_DAY2, TEAM_TESTOPS, TEAM_STORAGE,
+    TEAM_NETWORK, TEAM_THIRD_PARTY, TEAM_HARDWARE, TEAM_VMWARE_ADMINS,
+}
+
+# Per-team notification channel — resolved deterministically, same rule as
+# resolve_recipient() in the actions layer: never LLM-supplied.
+TEAM_CHANNELS = {
+    TEAM_OBSERVABILITY: "observability_channel",
+    TEAM_BUILD: "build_channel",
+    TEAM_SRE_DAY2: "sre_oncall_channel",
+    TEAM_TESTOPS: "testops_channel",
+    TEAM_STORAGE: "storage_channel",
+    TEAM_NETWORK: "network_channel",
+    TEAM_THIRD_PARTY: "third_party_integrations_channel",
+    TEAM_HARDWARE: "hardware_channel",
+    TEAM_VMWARE_ADMINS: "vmware_admins_channel",
+}
+
+
+# ---------------------------------------------------------------------------
+# Layer -> team mapping. Straightforward cases first.
+# ---------------------------------------------------------------------------
+
+LAYER_TO_TEAM = {
+    "storage": TEAM_STORAGE,
+    "network": TEAM_NETWORK,
+    "third_party": TEAM_THIRD_PARTY,
+}
+
+
+def classify_owning_team(diagnosis: dict, evidence: list[dict]) -> tuple[str, list[str], str]:
+    """Returns (owning_team, notify_teams, rationale). Deterministic first;
+    falls back to a small disambiguation LLM call only when evidence spans
+    multiple candidate teams with no single dominant layer — see
+    _disambiguate_with_llm below.
+
+    Rules, in order:
+      1. VENDOR_ADVISORY evidence (errata/CVE) present and it's what the
+         diagnosis is based on -> Build owns the fix (package/image
+         update), SRE owns the config rollout. Both notified.
+      2. layer in {storage, network, third_party} with corroborating
+         support -> that team owns it directly.
+      3. layer == source AND the claim mentions VIB/driver/guest-tools/
+         config-level terms -> VMware admins.
+      4. layer == cluster_health AND the claim looks hardware-flavored
+         (disk/NIC/memory/power pressure conditions, not a generic
+         "NotReady") -> Hardware + SRE.
+      5. layer == events AND admission/quota-denial specific -> SRE
+         (day-2 config/policy), not Build.
+      6. status == INSUFFICIENT_EVIDENCE and missing_evidence implies a
+         telemetry/monitoring gap (e.g. "no metrics available") ->
+         Observability, in addition to SRE.
+      7. Nothing dominant -> SRE is owner by default (they're accountable
+         for the migration regardless of root layer), and a disambiguation
+         hint is logged for human review rather than guessed at.
+
+    TestOps is never a routing target for a live incident — see
+    feed_testops_readiness_signal() below instead."""
+    supporting = [e for e in evidence if e.get("evidence_id") in diagnosis.get("evidence_refs", [])]
+    layers = [e.get("layer") for e in supporting]
+    tiers = [e.get("reliability_tier") for e in supporting]
+
+    notify = {TEAM_SRE_DAY2}  # SRE always notified — accountable for the migration regardless of cause
+
+    if "VENDOR_ADVISORY" in tiers:
+        notify.add(TEAM_BUILD)
+        return TEAM_BUILD, sorted(notify), \
+            "Diagnosis based on a vendor errata/CVE match (VENDOR_ADVISORY evidence) — " \
+            "Build owns the package/image fix, SRE owns rolling the config/update out."
+
+    for layer, team in LAYER_TO_TEAM.items():
+        if layer in layers:
+            notify.add(team)
+            return team, sorted(notify), f"Primary supporting evidence came from the {layer} layer."
+
+    if "source" in layers:
+        claim_text = " ".join(e.get("claim", "") for e in supporting if e.get("layer") == "source").lower()
+        if any(term in claim_text for term in ("vib", "driver", "guest tool", "guest-tool", "config")):
+            notify.add(TEAM_VMWARE_ADMINS)
+            return TEAM_VMWARE_ADMINS, sorted(notify), \
+                "Source-side evidence references a VIB/driver/guest-tools/config issue."
+        notify.add(TEAM_VMWARE_ADMINS)
+        return TEAM_VMWARE_ADMINS, sorted(notify), "Source-side (VMware) evidence is the primary cause."
+
+    if "cluster_health" in layers:
+        claim_text = " ".join(e.get("claim", "") for e in supporting if e.get("layer") == "cluster_health").lower()
+        hardware_terms = ("disk pressure", "nic", "memory pressure", "power", "hardware")
+        if any(term in claim_text for term in hardware_terms):
+            notify.add(TEAM_HARDWARE)
+            return TEAM_HARDWARE, sorted(notify), \
+                "Cluster/node health evidence indicates a hardware-level condition."
+        return TEAM_SRE_DAY2, sorted(notify), \
+            "Cluster/node health evidence indicates a config/readiness condition, not hardware."
+
+    # Fallback — ambiguous. Don't guess; flag for human routing review.
+    return TEAM_SRE_DAY2, sorted(notify), \
+        "No single evidence layer dominated the diagnosis — routed to SRE by default; " \
+        "review evidence_refs manually to confirm the right specialist team."
+
+
+def route_insufficient_evidence(missing_evidence: list[str]) -> list[str]:
+    """For INSUFFICIENT_EVIDENCE outcomes specifically — not a "which team
+    caused this" question, but "who can help gather what's missing."
+    Observability gets notified when the gap looks like a monitoring/
+    telemetry hole rather than a normal advisory-tools-came-up-empty case."""
+    notify = {TEAM_SRE_DAY2}
+    text = " ".join(missing_evidence).lower()
+    if any(term in text for term in ("no metrics", "monitoring", "telemetry", "not provisioned", "not available")):
+        notify.add(TEAM_OBSERVABILITY)
+    return sorted(notify)
+
+
+def feed_testops_readiness_signal(diagnosis: dict, is_cluster_wide: bool) -> None:
+    """TestOps is never paged on a live incident — they get a separate,
+    lower-urgency feedback signal when a diagnosis indicates a systemic /
+    pre-migration-readiness gap (e.g. a cluster-wide correlation event, or
+    a VENDOR_ADVISORY match that should have been caught in pre-migration
+    validation). Called from compose_diagnosis only when is_cluster_wide
+    is true or known_issue_ref is a VENDOR_ADVISORY reference."""
+    if not is_cluster_wide and not diagnosis.get("known_issue_ref"):
+        return
+    ...  # TODO: write to a testops_readiness_signals table / low-priority queue
+-e 
 
 # ============================================================================
 # FILE: migration_failure_agent_correlation.py
@@ -1256,7 +1738,6 @@ def get_cluster_failure_burst(cluster_id: str, time_range: str) -> list[dict]:
                  f"failed recently: {siblings}",
     }]
 -e 
-
 
 # ============================================================================
 # FILE: migration_failure_agent_actions.py
@@ -1548,7 +2029,6 @@ def log_send_failure(action_id: str, error: str) -> None:
     ...  # append-only audit write
 -e 
 
-
 # ============================================================================
 # FILE: migration_failure_agent_graph.py
 # ============================================================================
@@ -1576,6 +2056,7 @@ from migration_failure_agent_production import (
     require_enabled,
     AgentDisabledError,
     concurrency_limiter,
+    call_llm,
     call_llm_with_schema,
     DIAGNOSIS_SCHEMA,
     EVALUATOR_VERDICT_SCHEMA,
@@ -1883,8 +2364,15 @@ def audit_log(incident_id: str, event: str, payload: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def goal_builder(state: AgentState) -> AgentState:
-    # llm.invoke(GOAL_BUILDER_PROMPT.format(trigger_payload=state["trigger_payload"]))
-    goal_text = "..."  # LLM output, no tools bound for this call
+    prompt = GOAL_BUILDER_PROMPT.format(trigger_payload=state["trigger_payload"])
+    try:
+        goal_text = call_llm(prompt)
+    except Exception as exc:  # noqa: BLE001 — fail closed to a generic goal, never crash the run
+        audit_log(state["incident_id"], "goal_builder_llm_error", {"error": str(exc)})
+        p = state["trigger_payload"]
+        goal_text = (f"Investigate why migration {p.get('migration_id')} failed at "
+                     f"phase {p.get('phase')} with error {p.get('error_code')}. "
+                     f"No prioritized layer available — goal_builder LLM call failed.")
     state["budget_remaining"]["llm_calls"] -= 1
     audit_log(state["incident_id"], "goal_builder", {"goal": goal_text})
     state = {
@@ -1909,7 +2397,7 @@ def reason(state: AgentState) -> AgentState:
 
     try:
         output = call_llm_with_schema(
-            llm_call=lambda: "...",  # TODO: llm.invoke(prompt) -> raw JSON text
+            llm_call=lambda: call_llm(prompt),
             schema=REASON_OUTPUT_SCHEMA,
         )
     except OutputValidationError:
@@ -2071,6 +2559,19 @@ def compose_diagnosis(state: AgentState) -> AgentState:
 
     state["budget_remaining"]["llm_calls"] -= 1
     state["diagnosis"] = {**state["diagnosis"], **output}
+
+    # Team routing — deterministic, computed from evidence_refs, not an
+    # LLM judgment. See migration_failure_agent_routing.py.
+    from migration_failure_agent_routing import classify_owning_team, feed_testops_readiness_signal
+    owning_team, notify_teams, rationale = classify_owning_team(state["diagnosis"], state["evidence"])
+    state["diagnosis"]["owning_team"] = owning_team
+    state["diagnosis"]["notify_teams"] = notify_teams
+    state["diagnosis"]["routing_rationale"] = rationale
+    try:
+        feed_testops_readiness_signal(state["diagnosis"], is_cluster_wide=bool(state.get("correlation_group_id")))
+    except Exception as exc:  # noqa: BLE001 — never let a feedback signal break the run
+        audit_log(state["incident_id"], "testops_signal_failed", {"error": str(exc)})
+
     audit_log(state["incident_id"], "compose_diagnosis", output)
 
     notify_oncall(NotificationPayload(

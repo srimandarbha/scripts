@@ -1,0 +1,644 @@
+# Migration Failure Agent — Tool Reference Specification
+
+Auto-generated from `migration_failure_agent_tools.py` function signatures and docstrings — kept in sync with the actual code, not hand-maintained separately.
+
+## Output contract (applies to every tool below)
+
+Every tool returns `list[Evidence]`. Wrapped by the `@read_only_tool` decorator:
+- **On exception**: fails soft to `[]`, logged to the audit table — never raises into the agent loop
+- **On success**: every `claim` string passes through `sanitize_retrieved_text()` (injection defense) first
+- **Empty list is a valid, common result** for most tools — "checked, nothing anomalous," not "tool failed"
+
+```python
+class Evidence(TypedDict):
+    evidence_id: str; source_tool: str; layer: str; reliability_tier: str
+    timestamp: str; claim: str; supports: list[str]; contradicts: list[str]
+```
+
+## Quick Reference: Observability vs. On-Demand
+
+| Tool | Input(s) | Output (what the claim describes) | Source | Backend |
+|---|---|---|---|---|
+| `get_migration_plan_status` | migration_id | the MTV/Forklift Migration/Plan custom resource's status | **On-demand** | K8s API (live CR read) |
+| `get_vm_migration_conditions` | vm_id | per-VM migration CR conditions | **On-demand** | K8s API (live CR read) |
+| `get_datavolume_status` | dv_id | list[Evidence] — see tool docstring | **On-demand** | K8s API (live CR read) |
+| `get_namespace_events` | namespace, time_range | list[Evidence] — see tool docstring | **On-demand** | K8s API (live events) |
+| `get_pod_logs` | pod, time_range | a small set of relevant log lines, NOT a raw dump — pre-filter to error/warn level lines plus immediate context | **On-demand** | K8s API (live pod log tail) |
+| `get_migration_metrics` | migration_id, time_range | summary stats (avg/peak throughput, latency percentiles), not raw time series | **Observability** | Splunk metrics index |
+| `search_splunk_for_migration` | migration_id, time_range | list[Evidence] — see tool docstring | **Observability** | Splunk logs (SPL) |
+| `get_cluster_health` | — | overall cluster health status from RHOKP — operator health, control-plane readiness | **On-demand** | RHOKP live API |
+| `get_node_health` | node_id | that node's health — pressure conditions, readiness, recent restarts | **On-demand** | K8s API (live node status) |
+| `get_pvc_status` | pvc_id | the PVC's bind status, pending duration, and last event reason | **On-demand** | K8s API — must be live, changes rapidly mid-migration |
+| `get_storage_class_health` | sc_id | the storage class's current capacity/availability status — confirms or rules out capacity exhaustion as the cause | **Observability** | Splunk (OTel-exported capacity gauge) |
+| `get_csi_driver_logs` | driver, time_range | list[Evidence] — see tool docstring | **On-demand** | K8s API (live pod log tail) |
+| `get_network_attachment_status` | nad_id | the NetworkAttachmentDefinition's config and current status | **On-demand** | K8s API (live single-NAD read) |
+| `get_vcenter_events` | vm_id, time_range | list[Evidence] — see tool docstring | **On-demand** | vCenter API (live) |
+| `get_source_vm_config` | vm_id | list[Evidence] — see tool docstring | **On-demand** | vCenter API (live) |
+| `get_bmc_events` | host_id, time_range | list[Evidence] — see tool docstring | **On-demand** | Redfish/iLO/iDRAC API (live) |
+| `get_recent_cluster_changes` | time_range | list[Evidence] — see tool docstring | **On-demand** | Audit log / GitOps client (live query) |
+| `get_third_party_service_status` | service, time_range | list[Evidence] — see tool docstring | **On-demand** | Per-service health API (live) — freshness required |
+| `get_change_request_status` | migration_id | the linked CHG's approval status and approved window | **On-demand** | Change mgmt API — must be live, decision-critical |
+| `get_network_map_status` | migration_id | list[Evidence] — see tool docstring | **Observability** | Splunk (OTel-exported NetworkMap snapshot) |
+| `get_storage_map_status` | migration_id | list[Evidence] — see tool docstring | **Observability** | Splunk (OTel-exported StorageMap snapshot) |
+| `get_provider_status` | provider_id | list[Evidence] — see tool docstring | **Observability** | Splunk (OTel-exported Provider snapshot) |
+| `get_cluster_topology_snapshot` | cluster_id | list[Evidence] — see tool docstring | **Observability** | Splunk (OTel-exported topology metrics/logs) |
+| `get_target_vm_boot_status` | vm_id | the target VMI's guest-agent connection status and last console state | **On-demand** | KubeVirt VMI API (live) |
+| `get_cluster_resource_capacity` | cluster_id | list[Evidence] — see tool docstring | **Observability** | Splunk (OTel-exported CPU/memory gauges) |
+| `get_namespace_quota_status` | namespace | list[Evidence] — see tool docstring | **On-demand** | K8s API (live ResourceQuota/LimitRange) |
+| `search_sre_tracker_db` | fingerprint | list[Evidence] — see tool docstring | **On-demand** | Postgres DB query |
+| `search_product_documentation` | query | list[Evidence] — see tool docstring | **On-demand** | pgvector RAG query |
+| `get_similar_migrations` | fingerprint | list[Evidence] — see tool docstring | **On-demand** | Vector store similarity search |
+
+**8 tools read from Splunk (Observability)** — 
+pre-exported via OTel, fast, minutes-old freshness acceptable. 
+**21 tools call a live API/DB (On-demand)** — 
+either because freshness is decision-critical (PVC status mid-migration, CHG approval, third-party auth) or because the underlying data is cheap enough to query live and doesn't yet have an export pipeline (K8s CR reads, vCenter, tracker DB, RAG).
+
+---
+
+## 1. Control Plane
+
+### `get_migration_plan_status(migration_id: str)`
+
+**When to call:** Use FIRST for almost every incident. Returns the MTV/Forklift Migration/Plan custom resource's status.conditions for this migration_id — the phase it failed at and the controller's own stated reason string. This is often where the actual failure reason lives, distinct from any pod log. Does not return VM-level conditions (use get_vm_migration_conditions) or DataVolume status (use get_datavolume_status).
+
+**Args:** `migration_id: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    cr = k8s.get_custom_object(group="forklift.konveyor.io", version="v1beta1",
+                                namespace=NS, plural="migrations", name=migration_id)
+    for cond in cr["status"]["conditions"]:
+        yield make_evidence(..., claim=f"{cond['type']}: {cond['reason']} - {cond['message']}")
+```
+
+**Input provenance:** trigger — migration_id comes directly from the migration.failed trigger payload.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `get_vm_migration_conditions(vm_id: str)`
+
+**When to call:** Use when the plan-level status doesn't explain a per-VM failure in a multi-VM migration plan. Returns per-VM migration CR conditions. Complements, does not replace, get_migration_plan_status. Input source: trigger — vm_id comes directly from the trigger payload.
+
+**Args:** `vm_id: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    cr = k8s.get_custom_object(group="forklift.konveyor.io", version="v1beta1",
+                                namespace=NS, plural="vms", name=vm_id)
+    for cond in cr["status"]["conditions"]:
+        yield make_evidence(..., claim=f"VM {vm_id}: {cond['type']} - {cond['message']}")
+```
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `get_datavolume_status(dv_id: str)`
+
+**When to call:** Use when control-plane evidence points at disk/import failure. Returns the CDI DataVolume's status/conditions (e.g. ImportFailed, CloneScheduling). This is the bridge between control-plane and storage evidence — check this before jumping straight to PVC/storage-class tools if the plan status mentions a DataVolume by name.
+
+**Args:** `dv_id: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    dv = k8s.get_custom_object(group="cdi.kubevirt.io", version="v1beta1",
+                                namespace=NS, plural="datavolumes", name=dv_id)
+    for cond in dv["status"]["conditions"]:
+        yield make_evidence(..., claim=f"DataVolume {dv_id}: {cond['type']} - {cond['message']}")
+```
+
+**Input provenance:** evidence — dv_id is not in the trigger payload; it must be read from a DataVolume name mentioned in a prior get_migration_plan_status or get_vm_migration_conditions claim.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+## 2. Events
+
+### `get_namespace_events(namespace: str, time_range: str)`
+
+**When to call:** Use early, alongside control-plane checks. Catches failures with no pod log at all — scheduling failures, admission-webhook rejections, quota denials — because the pod or resource never came up in the first place. If control-plane status is vague ("Failed" with no detail), check here before assuming you need deeper logs.
+
+**Args:** `namespace: str, time_range: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    events = k8s.list_namespaced_event(namespace=namespace,
+                                        field_selector=f"lastTimestamp>={time_range.start}")
+    for e in events.items:
+        yield make_evidence(..., claim=f"{e.reason}: {e.message} (involved: {e.involved_object.name})")
+```
+
+**Input provenance:** trigger — namespace is derived from migration metadata in the trigger payload (typically the migration's target namespace), not discovered from evidence.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+## 3. Compute
+
+### `get_pod_logs(pod: str, time_range: str)`
+
+**When to call:** Use when control-plane/events evidence points at a specific pod (importer, conversion, virt-launcher). Returns a small set of relevant log lines, NOT a raw dump — pre-filter to error/warn level lines plus immediate context. For broad error-pattern search across many pods, prefer search_splunk_for_migration instead of calling this repeatedly.
+
+**Args:** `pod: str, time_range: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    raw = k8s.read_namespaced_pod_log(name=pod, namespace=NS, since_seconds=time_range.seconds)
+    error_lines = [l for l in raw.splitlines() if "ERROR" in l or "WARN" in l]
+    for line in error_lines[:MAX_LINES]:
+        yield make_evidence(..., claim=line)
+```
+
+**Input provenance:** evidence — pod is not in the trigger payload; it must be read from a pod name mentioned in a prior get_migration_plan_status, get_vm_migration_conditions, or get_namespace_events claim.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `get_migration_metrics(migration_id: str, time_range: str)`
+
+**When to call:** Use to check throughput/latency shape around the failure time — confirms or rules out a stall/timeout hypothesis. Returns summary stats (avg/peak throughput, latency percentiles), not raw time series.
+
+**Args:** `migration_id: str, time_range: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    stats = metrics_client.query_range(
+        query=f'migration_throughput{{migration_id="{migration_id}"}}',
+        start=time_range.start, end=time_range.end)
+    summary = {"avg": mean(stats), "p95_latency": percentile(stats, 95)}
+    yield make_evidence(..., claim=f"Throughput/latency summary: {summary}")
+```
+
+**Input provenance:** trigger — migration_id and an approximate time_range are both derivable directly from the trigger payload's failed_at field.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `search_splunk_for_migration(migration_id: str, time_range: str)`
+
+**When to call:** Use for a broad error-signature sweep across all components involved in this migration, when you don't yet know which specific pod to check. Runs a scoped SPL query and returns PRE-AGGREGATED error signatures (error type + count + first/last seen), never raw log lines — do not modify this tool to return raw text, it will blow the context budget. Prefer get_pod_logs once you already know which pod to look at. Input source: trigger — migration_id and time_range both derivable directly from the trigger payload.
+
+**Args:** `migration_id: str, time_range: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    spl = (f'index=ocp_logs migration_id="{migration_id}" '
+           f'earliest={time_range.start} latest={time_range.end} '
+           f'| stats count by error_signature | sort -count | head 10')
+    job = splunk.jobs.oneshot(spl)
+    for row in job:
+        yield make_evidence(..., claim=f"'{row.error_signature}' x{row.count}, first {row.first_seen}")
+```
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+## 4. Cluster Health
+
+### `get_cluster_health()`
+
+**When to call:** Use to rule out (or confirm) a cluster-wide issue before assuming the failure is specific to this migration. Returns overall cluster health status from RHOKP — operator health, control-plane readiness.
+
+**Args:** _none_
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    status = rhokp_client.get_cluster_operators_summary()
+    if status["degraded_operators"]:
+        yield make_evidence(..., claim=f"Degraded operators: {status['degraded_operators']}")
+```
+
+**Input provenance:** none — takes no incident-specific input; safe to call at any point in the loop.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `get_node_health(node_id: str)`
+
+**When to call:** Use when evidence points at a specific node (e.g. the VM/pod was scheduled there). Returns that node's health — pressure conditions, readiness, recent restarts.
+
+**Args:** `node_id: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    node = k8s.read_node(name=node_id)
+    pressures = [c for c in node.status.conditions if c.status == "True" and "Pressure" in c.type]
+    yield make_evidence(..., claim=f"Node {node_id} conditions: {pressures or 'nominal'}")
+```
+
+**Input provenance:** evidence — node_id is not in the trigger payload; it must be read from a node name mentioned in a prior get_pod_logs, get_namespace_events, or get_vm_migration_conditions claim.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+## 5. Storage
+
+### `get_pvc_status(pvc_id: str)`
+
+**When to call:** Use when a migration is stuck or failed and control-plane evidence points at storage (e.g. a DataVolume in ImportFailed). Returns the PVC's bind status, pending duration, and last event reason. Does not return CSI driver logs — use get_csi_driver_logs for that. Input source: evidence — pvc_id is not in the trigger payload; it must be read from a PVC name mentioned in a prior get_datavolume_status claim. A healthy/Bound result here is itself meaningful — it rules out storage as the cause rather than being an inconclusive check.
+
+**Args:** `pvc_id: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    pvc = k8s.read_namespaced_persistent_volume_claim(name=pvc_id, namespace=NS)
+    pending_for = now() - pvc.metadata.creation_timestamp if pvc.status.phase == "Pending" else None
+    yield make_evidence(..., claim=f"PVC {pvc_id}: {pvc.status.phase}, pending_for={pending_for}")
+```
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `get_storage_class_health(sc_id: str)`
+
+**When to call:** Use when get_pvc_status shows Pending with a provisioning reason. Returns the storage class's current capacity/availability status — confirms or rules out capacity exhaustion as the cause.
+
+**Args:** `sc_id: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    sc = k8s.read_storage_class(name=sc_id)
+    capacity = storage_backend_client.get_capacity(sc.provisioner)
+    yield make_evidence(..., claim=f"Storage class {sc_id} ({sc.provisioner}): {capacity}")
+```
+
+**Input provenance:** evidence — sc_id is normally read from the storageClassName field in a prior get_pvc_status claim. Falls back to config only if this cluster has a single default storage class known ahead of time.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `get_csi_driver_logs(driver: str, time_range: str)`
+
+**When to call:** Use when PVC and storage-class evidence don't fully explain a provisioning failure — the CSI driver's own logs often carry the underlying array/backend error. Pre-filter to error-level lines. Input source: evidence — driver name is normally read from the provisioner field in a prior get_storage_class_health claim; falls back to config only if this cluster runs a single CSI driver known ahead of time.
+
+**Args:** `driver: str, time_range: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    pods = k8s.list_pods(label_selector=f"app={driver}")
+    for pod in pods:
+        raw = k8s.read_namespaced_pod_log(name=pod.name, since_seconds=time_range.seconds)
+        for line in [l for l in raw.splitlines() if "ERROR" in l][:MAX_LINES]:
+            yield make_evidence(..., claim=line)
+```
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+## 6. Network
+
+### `get_network_attachment_status(nad_id: str)`
+
+**When to call:** Use when a network-mapping mismatch is a live hypothesis (e.g. a historical/tracker match suggested it, or metrics show zero throughput from the start rather than a mid-transfer stall). Returns the NetworkAttachmentDefinition's config and current status.
+
+**Args:** `nad_id: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    nad = k8s.get_custom_object(group="k8s.cni.cncf.io", version="v1",
+                                 namespace=NS, plural="network-attachment-definitions", name=nad_id)
+    yield make_evidence(..., claim=f"NAD {nad_id} config: {nad['spec']['config']}")
+```
+
+**Input provenance:** evidence — nad_id is normally read from the network mapping named in a prior get_vm_migration_conditions claim; falls back to config only if this cluster/namespace has a single NAD known ahead of time.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+## 7. Source
+
+### `get_vcenter_events(vm_id: str, time_range: str)`
+
+**When to call:** Use when target-side evidence (control-plane, storage, network, compute) does not explain the failure — this checks whether the problem originated on the source (VMware) side instead: snapshot issues, permission errors, VM in an invalid state at the time of migration. This is the tool most likely to be missing early on; a target-side-only diagnosis should be treated as incomplete until this layer has also been checked or is confirmed unavailable.
+
+**Args:** `vm_id: str, time_range: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    events = vcenter_client.query_events(entity=vm_id, start=time_range.start, end=time_range.end)
+    for e in events:
+        yield make_evidence(..., claim=f"{e.eventTypeId}: {e.fullFormattedMessage}")
+```
+
+**Input provenance:** trigger — vm_id comes directly from the trigger payload.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `get_source_vm_config(vm_id: str)`
+
+**When to call:** Use alongside get_vcenter_events when the failure might stem from the source VM's own configuration (unsupported disk type, snapshot present, guest tools state) rather than anything on the target side.
+
+**Args:** `vm_id: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    vm = vcenter_client.get_vm(vm_id)
+    config = {"disk_type": vm.disk_type, "has_snapshot": vm.snapshot is not None,
+              "guest_tools_status": vm.guest.toolsStatus}
+    yield make_evidence(..., claim=f"Source VM {vm_id} config: {config}")
+```
+
+**Input provenance:** trigger — vm_id comes directly from the trigger payload.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `get_bmc_events(host_id: str, time_range: str)`
+
+**When to call:** Bare-metal equivalent of get_vcenter_events — use in place of it when the migration source is a bare-metal host rather than VMware. Returns Redfish/iLO/iDRAC event log entries for the source host around the failure window.
+
+**Args:** `host_id: str, time_range: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    events = redfish_client.get_event_log(host_id, start=time_range.start, end=time_range.end)
+    for e in events:
+        yield make_evidence(..., claim=f"{e.severity}: {e.message}")
+```
+
+**Input provenance:** trigger — host_id comes directly from the trigger payload for bare-metal-sourced migrations.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+## 8. Change Correlation
+
+### `get_recent_cluster_changes(time_range: str)`
+
+**When to call:** Use when no single-layer root cause is emerging and the timing is suspicious — checks for cluster upgrades, node drains, or config changes around the failure window that could correlate.
+
+**Args:** `time_range: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    changes = audit_log_client.query(kinds=["ClusterVersion", "MachineConfig", "Node"],
+                                      verb="update", time_range=time_range)
+    for c in changes:
+        yield make_evidence(..., claim=f"{c.kind}/{c.name} changed at {c.timestamp} by {c.user}")
+```
+
+**Input provenance:** trigger — time_range is derived from the trigger payload's failed_at timestamp; takes no other incident-specific input.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+## 8b. Third-Party & Change Management
+
+### `get_third_party_service_status(service: str, time_range: str)`
+
+**When to call:** Use when a failure looks like an auth, secrets, or image-pull problem rather than a migration-specific one — e.g. pod logs mention 401/403, token expiry, or 'ImagePullBackOff' against an internal registry. service must be one of: 'vault', 'entraid', 'nexus'. Tag layer=third_party so it routes to the third-party integrations team, not SRE or Build.
+
+**Args:** `service: str, time_range: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    status = third_party_client.get_health(service, window=time_range)
+    yield make_evidence(..., layer="third_party",
+                         claim=f"{service}: {status.summary} (last_error={status.last_error})")
+```
+
+**Input provenance:** derived — service is inferred by the reason node from the error text in other evidence (e.g. a 401 from Vault implies service='vault'), not from the trigger payload.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `get_change_request_status(migration_id: str)`
+
+**When to call:** Use early, alongside control-plane checks — a migration executed outside its approved CHG window, or against an unapproved change, is a process-compliance root cause distinct from any technical layer, and nothing else checks for it. Returns the linked CHG's approval status and approved window.
+
+**Args:** `migration_id: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    chg = change_mgmt_client.get_linked_change(migration_id)
+    in_window = chg.approved and chg.window_start <= now() <= chg.window_end
+    yield make_evidence(..., claim=f"CHG {chg.id}: approved={chg.approved}, "
+                                    f"in_window={in_window} ({chg.window_start}-{chg.window_end})")
+```
+
+**Input provenance:** trigger — migration_id comes directly from the trigger payload.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+## 8c. Topology/Config (OTel to Splunk)
+
+### `get_network_map_status(migration_id: str)`
+
+**When to call:** Use when a network-mapping mismatch is a live hypothesis and you need the FULL source-network -> target-NAD mapping, not just one NAD's status (see get_network_attachment_status for that). Reads from Splunk (OTel-exported NetworkMap CR snapshot, ~5-15 min freshness), not a live K8s call — fast.
+
+**Args:** `migration_id: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    spl = f'index=cluster_config sourcetype=networkmap migration_id="{migration_id}"
+           | head 1'
+    row = splunk.jobs.oneshot(spl)
+    yield make_evidence(..., reliability_tier="CURRENT_HEALTH_API",
+                         claim=f"NetworkMap: {row.mappings}, valid={row.valid}, "
+                               f"last_synced={row.export_timestamp}")
+```
+
+**Input provenance:** trigger — migration_id comes directly from the trigger payload.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `get_storage_map_status(migration_id: str)`
+
+**When to call:** Use when a storage-mapping mismatch is a live hypothesis — the FULL source-datastore -> target-storage-class mapping. Reads from Splunk (OTel-exported StorageMap CR snapshot), same freshness/speed profile as get_network_map_status.
+
+**Args:** `migration_id: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+ same shape as get_network_map_status, sourcetype=storagemap.
+```
+
+**Input provenance:** trigger — migration_id comes directly from the trigger payload.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `get_provider_status(provider_id: str)`
+
+**When to call:** Use when you need to know which source provider (vCenter/oVirt/ OpenStack/host) a migration is tied to, and whether that provider's connection is healthy — e.g. a burst of failures across many migrations might trace back to one degraded Provider connection rather than per-VM issues. Reads from Splunk (OTel-exported Provider CR snapshot).
+
+**Args:** `provider_id: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    spl = f'index=cluster_config sourcetype=provider provider_id="{provider_id}" | head 1'
+    row = splunk.jobs.oneshot(spl)
+    yield make_evidence(..., claim=f"Provider {provider_id} ({row.type}): "
+                                    f"connected={row.connected}, last_sync={row.last_sync}")
+```
+
+**Input provenance:** evidence — provider_id is normally read from a provider reference in a prior get_migration_plan_status claim, not from the trigger payload directly.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `get_cluster_topology_snapshot(cluster_id: str)`
+
+**When to call:** Use for a broad picture of what's available on this cluster — storage classes and their current capacity (OTel gauge metric, 1-5 min freshness), CSI driver versions, NAD inventory, node counts. Useful early when a cluster-wide correlation burst is detected (see migration_failure_agent_correlation.py) and you want cluster context without querying each subsystem individually.
+
+**Args:** `cluster_id: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    spl = f'index=cluster_metrics cluster_id="{cluster_id}" earliest=-15m
+           | stats latest(*) by metric_name'
+    rows = splunk.jobs.oneshot(spl)
+    yield make_evidence(..., claim=f"Cluster {cluster_id} topology: {rows}")
+```
+
+**Input provenance:** trigger — cluster_id comes directly from the trigger payload.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+## 9. Knowledge & Memory
+
+### `search_sre_tracker_db(fingerprint: str)`
+
+**When to call:** Query the SRE tracker's confirmed-fix table (sre_tracker_fixes) by symptom fingerprint. Use this EARLY among the advisory tools — a confirmed prior fix is the strongest non-live signal available. Returns only confirmed=true rows; tag reliability_tier=CONFIRMED_FIX and include fix_id/ticket_ref in the claim text. An empty result is a normal, common outcome — it means no team member has confirmed-fixed this exact fingerprint before, not that something is wrong. Never treat a match here as sufficient on its own — it must be corroborated by at least one live-layer tool before it can raise confidence.
+
+**Args:** `fingerprint: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). An empty result is a normal, common outcome — it means no team member has confirmed-fixed this exact fingerprint before, not that something is wrong.
+
+**Pseudocode:**
+```python
+    rows = db.execute(
+        "SELECT fix_id, root_cause, resolution_steps, ticket_ref "
+        "FROM sre_tracker_fixes WHERE symptom_fingerprint = %s AND confirmed = true",
+        (fingerprint,))
+    for r in rows:
+        yield make_evidence(..., reliability_tier="CONFIRMED_FIX",
+                             claim=f"Fix {r.fix_id}: {r.root_cause} - {r.resolution_steps}")
+```
+
+**Input provenance:** derived — fingerprint is built by build_symptom_fingerprint() from the trigger payload plus evidence gathered so far, not read directly from either.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `search_product_documentation(query: str)`
+
+**When to call:** Query the RHOKP offline knowledge portal (pgvector RAG over solutions, articles, product articles, errata, and CVEs) plus MTV/OCV/OCP docs. Results are NOT all equally trustworthy — tag by content_type: 'errata' and 'cve' hits (official Red Hat published defect/security records) get reliability_tier=VENDOR_ADVISORY; 'solution', 'article', and 'product_article' hits get reliability_tier=HISTORICAL_RAG (generic guidance, weakest tier). Neither tier confirms a fix was applied in THIS environment before — that's what search_sre_tracker_db is for. An empty result is normal — fall back to live-layer evidence only.
+
+**Args:** `query: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). An empty result is normal — fall back to live-layer evidence only.
+
+**Pseudocode:**
+```python
+    query_vec = embed(query)
+    results = pgvector_client.similarity_search(query_vec, top_k=5)
+    for r in results:  # r.content_type in {solution, article, product_article, errata, cve}
+        tier = "VENDOR_ADVISORY" if r.content_type in ("errata", "cve") else "HISTORICAL_RAG"
+        yield make_evidence(..., reliability_tier=tier,
+                             claim=f"[{r.content_type}:{r.ref}] {r.text}")
+```
+
+**Input provenance:** derived — query is composed by the reason node from the goal and current evidence, not a fixed field from the trigger payload.
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
+
+### `get_similar_migrations(fingerprint: str)`
+
+**When to call:** Query the organizational-memory vector store for past migration incidents with a similar symptom fingerprint, confirmed correct or corrected by a human after resolution. Advisory only, same as search_sre_tracker_db — a similar past incident can raise a hypothesis, never confirm one by itself.
+
+**Args:** `fingerprint: str`
+
+**Failure / empty condition:** Exception → `[]` (fail-soft, audit-logged). Empty result: no anomaly found in this layer — normal, informative, not an error.
+
+**Pseudocode:**
+```python
+    query_vec = embed(fingerprint)
+    matches = vector_store.similarity_search(query_vec, top_k=5, min_score=0.75)
+    for m in matches:
+        yield make_evidence(..., claim=f"Similar incident {m.incident_id}: {m.root_cause} "
+                                        f"(was_correct={m.was_correct})")
+```
+
+**Input provenance:** derived — same fingerprint as search_sre_tracker_db, built by build_symptom_fingerprint().
+
+**Output:** `list[Evidence]` per the contract above.
+
+---
