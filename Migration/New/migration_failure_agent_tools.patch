@@ -1,0 +1,49 @@
+--- migration_failure_agent_tools.py.orig	2026-09-28 22:41:47.611631281 +0000
++++ migration_failure_agent_tools.py	2026-09-28 22:43:02.110115506 +0000
+@@ -49,6 +49,18 @@
+     contradicts: list[str]
+ 
+ 
++class ToolEvidenceList(list):
++    """Backward-compatible list carrying explicit tool execution status.
++
++    Existing callers can keep iterating a tool result as a list of Evidence,
++    while the new gateway can distinguish SUCCESS, NO_DATA and ERROR.
++    """
++    def __init__(self, items=None, *, status="SUCCESS", error=None):
++        super().__init__(items or [])
++        self.status = status
++        self.error = error
++
++
+ RELIABILITY_TIERS = {
+     "LIVE_TELEMETRY": "LIVE_TELEMETRY",
+     "CURRENT_HEALTH_API": "CURRENT_HEALTH_API",
+@@ -103,19 +115,24 @@
+          takes down the whole agent run.
+     """
+     @functools.wraps(fn)
+-    def wrapper(*args, **kwargs) -> list[Evidence]:
++    def wrapper(*args, **kwargs) -> ToolEvidenceList:
+         start = time.monotonic()
+         try:
+             result = fn(*args, **kwargs)
++        except TimeoutError as exc:
++            audit_log_tool_call(fn.__name__, args, kwargs, error=str(exc), evidence_count=0,
++                                 latency_s=time.monotonic() - start)
++            return ToolEvidenceList(status="TIMEOUT", error=str(exc))
+         except Exception as exc:  # noqa: BLE001 — fail-soft by design here
+             audit_log_tool_call(fn.__name__, args, kwargs, error=str(exc), evidence_count=0,
+                                  latency_s=time.monotonic() - start)
+-            return []
++            return ToolEvidenceList(status="ERROR", error=str(exc))
+         for e in result:
+             e["claim"] = sanitize_retrieved_text(e["claim"])
++        status = "SUCCESS" if result else "NO_DATA"
+         audit_log_tool_call(fn.__name__, args, kwargs, error=None, evidence_count=len(result),
+                              latency_s=time.monotonic() - start)
+-        return result
++        return ToolEvidenceList(result, status=status)
+     return wrapper
+ 
+ 

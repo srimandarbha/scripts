@@ -1,0 +1,270 @@
+"""
+Migration Failure Agent — cluster-wide correlation layer.
+
+Problem this solves: if N VM migrations to the SAME cluster fail around the
+same time from one shared root cause (storage capacity, a bad node, a
+cluster upgrade), running N independent full investigations is wasteful and
+can produce N slightly-inconsistent diagnoses for one actual problem.
+
+This layer runs BEFORE the LangGraph loop starts, in run_agent() — it is
+NOT a graph node. Two behaviors:
+
+  1. First incident in a cluster-failure burst -> becomes the "representative"
+     for a new correlation group. Runs the full investigation as normal,
+     but is seeded with burst evidence up front so it prioritizes
+     cluster-wide layers over VM-specific ones. When it reaches a
+     diagnosis, that diagnosis is broadcast to every sibling in the group.
+
+  2. Subsequent incidents arriving while the representative already has a
+     diagnosis -> SHORT-CIRCUITED. They never run the full graph at all;
+     they get a lightweight diagnosis referencing the representative's
+     evidence, with one confirming check, not a full re-investigation.
+
+Incidents arriving while the representative is STILL investigating join the
+group and run normally (correlation isn't proof yet) — but will still
+receive the broadcast once the representative finishes, which supersedes
+their own independent result if it finishes second.
+"""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Optional
+
+CORRELATION_WINDOW_MINUTES = 15   # how far back to look for sibling failures
+CORRELATION_BURST_THRESHOLD = 3   # >= this many failures on one cluster triggers grouping
+
+
+@dataclass
+class CorrelationGroup:
+    group_id: str
+    cluster_id: str
+    representative_incident_id: str
+    representative_status: str        # mirrors the representative incident's status
+    representative_diagnosis: Optional[dict] = None
+    member_incident_ids: list[str] = field(default_factory=list)
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+# ---------------------------------------------------------------------------
+# Burst detection — a cheap deterministic query, not an LLM tool. Also
+# exposed as a bound tool (get_cluster_failure_burst, see bottom) so the
+# investigating agent itself can see the same signal mid-investigation, not
+# just at intake.
+# ---------------------------------------------------------------------------
+
+def count_recent_cluster_failures(cluster_id: str, window_minutes: int = CORRELATION_WINDOW_MINUTES) -> list[str]:
+    """Returns migration_ids of OTHER incidents on this cluster with
+    status NEW/GATHERING_EVIDENCE/EVALUATING/COMPLETED within the window.
+    Pseudocode:
+        rows = db.execute(
+            "SELECT migration_id FROM incidents WHERE cluster_id = %s "
+            "AND created_at >= now() - interval %s AND status != 'ESCALATED'",
+            (cluster_id, f"{window_minutes} minutes"))
+        return [r.migration_id for r in rows]
+    """
+    ...  # TODO: real query
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Group lifecycle — called from run_agent(), before the graph is invoked
+# ---------------------------------------------------------------------------
+
+def find_or_create_correlation_group(incident_id: str, cluster_id: str) -> tuple[CorrelationGroup, bool]:
+    """Called once per incident, at the very start of run_agent(), before
+    the kill switch / concurrency / graph invocation. Returns
+    (group, is_representative).
+
+    is_representative=True means this incident should run the full
+    investigation (seeded with burst evidence). is_representative=False
+    means it joined an existing group — caller must then check
+    group.representative_diagnosis: if set, short-circuit via
+    attach_to_existing_diagnosis(); if not set yet, run normally anyway
+    (the representative hasn't concluded, correlation is a hint, not proof)."""
+    siblings = count_recent_cluster_failures(cluster_id)
+
+    existing_group = load_active_group_for_cluster(cluster_id)
+    if existing_group:
+        existing_group.member_incident_ids.append(incident_id)
+        persist_group(existing_group)
+        return existing_group, False
+
+    if len(siblings) + 1 < CORRELATION_BURST_THRESHOLD:
+        # Not a burst yet — no group created. This incident investigates
+        # entirely independently, same as always.
+        return CorrelationGroup(
+            group_id=str(uuid.uuid4()), cluster_id=cluster_id,
+            representative_incident_id=incident_id, representative_status="INVESTIGATING",
+            member_incident_ids=[incident_id],
+        ), True
+
+    # Threshold crossed on THIS incident — it becomes the representative.
+    group = CorrelationGroup(
+        group_id=str(uuid.uuid4()), cluster_id=cluster_id,
+        representative_incident_id=incident_id, representative_status="INVESTIGATING",
+        member_incident_ids=[incident_id] + siblings,
+    )
+    persist_group(group)
+    return group, True
+
+
+def build_burst_evidence(group: CorrelationGroup) -> Optional[dict]:
+    """Only called for the representative when a real burst was detected
+    (len(member_incident_ids) >= CORRELATION_BURST_THRESHOLD). Returns an
+    Evidence-shaped dict to seed into the initial AgentState.evidence list
+    BEFORE goal_builder runs, so the very first goal already reflects this
+    — the representative shouldn't spend a tool call discovering what
+    run_agent already knows at intake."""
+    if len(group.member_incident_ids) < CORRELATION_BURST_THRESHOLD:
+        return None
+    return {
+        "evidence_id": str(uuid.uuid4()),
+        "source_tool": "correlation_layer",
+        "layer": "cluster_health",
+        "reliability_tier": "LIVE_TELEMETRY",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "claim": f"{len(group.member_incident_ids)} migrations on cluster "
+                 f"{group.cluster_id} have failed within {CORRELATION_WINDOW_MINUTES} "
+                 f"minutes ({group.member_incident_ids}). Prioritize cluster-wide "
+                 f"layers (cluster health, recent cluster changes) over VM-specific "
+                 f"root causes.",
+        "supports": [],
+        "contradicts": [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Short-circuit path — for incidents joining a group whose representative
+# already has a diagnosis. Never invokes the LangGraph loop at all.
+# ---------------------------------------------------------------------------
+
+def attach_to_existing_diagnosis(incident_id: str, group: CorrelationGroup) -> dict:
+    """Produces a lightweight diagnosis for a sibling incident by
+    referencing the representative's already-confirmed diagnosis, instead
+    of re-running the full investigation. Still does ONE cheap live check
+    (not a full loop) to confirm this VM's symptom is actually consistent
+    with the shared cause, rather than blindly assuming every failure on
+    the cluster during the window shares the same root cause."""
+    parent = group.representative_diagnosis
+    consistent = confirm_consistent_symptom(incident_id, parent)  # one cheap tool call, not a full loop
+
+    if not consistent:
+        # Symptom doesn't match the group's cause — do NOT force-attach a
+        # wrong diagnosis. Fall back to a normal independent investigation.
+        return {"short_circuited": False}
+
+    diagnosis = {
+        "incident_id": incident_id,
+        "status": "DIAGNOSIS_READY",
+        "root_cause": f"Same as incident {group.representative_incident_id}: {parent['root_cause']}",
+        "confidence_band": parent["confidence_band"],
+        "evidence_refs": parent["evidence_refs"],
+        "recommended_action": parent["recommended_action"],
+        "known_issue_ref": parent.get("known_issue_ref"),
+        "correlation_group_id": group.group_id,
+        "correlated_with": group.representative_incident_id,
+    }
+    persist_diagnosis(incident_id, diagnosis)
+    notify_correlated_diagnosis(incident_id, group)
+    return {"short_circuited": True, **diagnosis}
+
+
+def confirm_consistent_symptom(incident_id: str, parent_diagnosis: dict) -> bool:
+    """Fail closed until a real per-incident signature check is wired.
+
+    Correlation is only a cost-saving hint. A sibling must not inherit a
+    representative diagnosis without a targeted current-state consistency
+    check.
+    """
+    current = load_incident_signature(incident_id)
+    parent = parent_diagnosis.get("symptom_signature") or {}
+    if not current or not parent:
+        return False
+    required = ("issue_tag", "phase", "error_code")
+    return all(current.get(k) and parent.get(k) and current.get(k) == parent.get(k) for k in required)
+
+
+def load_incident_signature(incident_id: str) -> Optional[dict]:
+    """TODO: SELECT issue_tag, phase, error_code FROM incidents WHERE incident_id=%s.
+
+    Until the authoritative incident store is wired, returning None is the
+    safe behavior because correlation cannot be treated as proof.
+    """
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Broadcast — called after the representative's compose_diagnosis finishes
+# ---------------------------------------------------------------------------
+
+def broadcast_diagnosis_to_group(representative_incident_id: str, diagnosis: dict) -> None:
+    """Called from the graph's compose_diagnosis node (or run_agent right
+    after) once the representative reaches DIAGNOSIS_READY. Updates the
+    group record so any NEW incidents arriving on this cluster short-
+    circuit immediately, and notifies any siblings that joined the group
+    while still investigating independently."""
+    group = load_group_by_representative(representative_incident_id)
+    if not group:
+        return
+    group.representative_status = "DIAGNOSIS_READY"
+    group.representative_diagnosis = diagnosis
+    persist_group(group)
+
+    for member_id in group.member_incident_ids:
+        if member_id == representative_incident_id:
+            continue
+        notify_correlated_diagnosis(member_id, group)
+
+
+def notify_correlated_diagnosis(incident_id: str, group: CorrelationGroup) -> None:
+    ...  # informational notify, reuses send_informational_email pattern
+
+
+# ---------------------------------------------------------------------------
+# Persistence stubs
+# ---------------------------------------------------------------------------
+
+def load_active_group_for_cluster(cluster_id: str) -> Optional[CorrelationGroup]:
+    ...  # SELECT * FROM correlation_groups WHERE cluster_id = %s AND status = 'ACTIVE'
+    return None
+
+
+def load_group_by_representative(representative_incident_id: str) -> Optional[CorrelationGroup]:
+    ...  # SELECT * FROM correlation_groups WHERE representative_incident_id = %s
+    return None
+
+
+def persist_group(group: CorrelationGroup) -> None:
+    ...  # UPSERT INTO correlation_groups (...)
+
+
+def persist_diagnosis(incident_id: str, diagnosis: dict) -> None:
+    ...  # same diagnosis table compose_diagnosis writes to
+
+
+# ---------------------------------------------------------------------------
+# Bound tool — lets the investigating agent see the same burst signal
+# mid-run, not just at intake. Add this to TOOLS in migration_failure_agent_tools.py.
+# ---------------------------------------------------------------------------
+
+def get_cluster_failure_burst(cluster_id: str, time_range: str) -> list[dict]:
+    """Use if you suspect this failure might not be VM-specific — e.g.
+    a generic timeout with no clear cause, or if get_cluster_health already
+    looked degraded. Returns how many OTHER migrations on this same cluster
+    have failed recently. A count >= 3 within ~15 minutes strongly suggests
+    a shared cluster-level cause rather than a per-VM issue — prioritize
+    get_cluster_health and get_recent_cluster_changes accordingly. Input
+    source: trigger — cluster_id comes from the trigger payload's cluster
+    metadata (NOTE: the trigger payload must include cluster_id for this
+    tool and the correlation layer above to work at all)."""
+    siblings = count_recent_cluster_failures(cluster_id)
+    if not siblings:
+        return []
+    return [{
+        "layer": "cluster_health", "reliability_tier": "LIVE_TELEMETRY",
+        "claim": f"{len(siblings)} other migrations on cluster {cluster_id} "
+                 f"failed recently: {siblings}",
+    }]

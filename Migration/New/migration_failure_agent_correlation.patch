@@ -1,0 +1,35 @@
+--- migration_failure_agent_correlation.py.orig	2026-09-28 22:41:47.613342830 +0000
++++ migration_failure_agent_correlation.py	2026-09-28 22:43:47.891862631 +0000
+@@ -173,11 +173,27 @@
+ 
+ 
+ def confirm_consistent_symptom(incident_id: str, parent_diagnosis: dict) -> bool:
+-    """One cheap, targeted check — e.g. re-run just get_migration_plan_status
+-    for this incident and compare its error_code/phase against the
+-    representative's. This is intentionally NOT a full graph run."""
+-    ...  # TODO
+-    return True
++    """Fail closed until a real per-incident signature check is wired.
++
++    Correlation is only a cost-saving hint. A sibling must not inherit a
++    representative diagnosis without a targeted current-state consistency
++    check.
++    """
++    current = load_incident_signature(incident_id)
++    parent = parent_diagnosis.get("symptom_signature") or {}
++    if not current or not parent:
++        return False
++    required = ("issue_tag", "phase", "error_code")
++    return all(current.get(k) and parent.get(k) and current.get(k) == parent.get(k) for k in required)
++
++
++def load_incident_signature(incident_id: str) -> Optional[dict]:
++    """TODO: SELECT issue_tag, phase, error_code FROM incidents WHERE incident_id=%s.
++
++    Until the authoritative incident store is wired, returning None is the
++    safe behavior because correlation cannot be treated as proof.
++    """
++    return None
+ 
+ 
+ # ---------------------------------------------------------------------------

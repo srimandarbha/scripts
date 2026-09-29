@@ -1,0 +1,52 @@
+--- migration_failure_agent_production.py.orig	2026-09-28 22:41:47.610015295 +0000
++++ migration_failure_agent_production.py	2026-09-28 22:43:40.169315054 +0000
+@@ -251,29 +251,38 @@
+     },
+ }
+ 
+-REASON_OUTPUT_SCHEMA = {
++HYPOTHESIS_OUTPUT_SCHEMA = {
+     "type": "object",
+-    "required": ["action"],
++    "required": ["hypotheses"],
+     "properties": {
+-        "action": {"enum": ["call_tool", "goal_answered"]},
+-        "tool_name": {"type": ["string", "null"]},
+-        "tool_args": {"type": "object"},
+-        "new_hypothesis": {"type": ["string", "null"]},
+-        "evidence_links": {
++        "hypotheses": {
+             "type": "array",
+             "items": {
+                 "type": "object",
+-                "required": ["evidence_id", "hypothesis_id", "relation"],
++                "required": ["statement", "issue_tag", "expected_fact_codes", "required_fact_codes"],
+                 "properties": {
+-                    "evidence_id": {"type": "string"},
+-                    "hypothesis_id": {"type": "string"},  # may be "NEW" to reference new_hypothesis above
+-                    "relation": {"enum": ["supports", "contradicts"]},
++                    "statement": {"type": "string"},
++                    "issue_tag": {"type": "string"},
++                    "expected_fact_codes": {"type": "array", "items": {"type": "string"}},
++                    "required_fact_codes": {"type": "array", "items": {"type": "string"}},
+                 },
+             },
+         },
+     },
+ }
+ 
++RECOMMENDATION_SCHEMA = {
++    "type": "object",
++    "required": ["action_type", "summary", "steps", "preconditions"],
++    "properties": {
++        "action_type": {"enum": ["INVESTIGATE", "FIX_FORWARD", "RETRY", "ROLLBACK", "ROLLBACK_AND_RETRY"]},
++        "summary": {"type": "string"},
++        "steps": {"type": "array", "items": {"type": "string"}},
++        "preconditions": {"type": "array", "items": {"type": "string"}},
++    },
++}
++
++
+ 
+ # ---------------------------------------------------------------------------
+ # 5. Human-facing delivery
