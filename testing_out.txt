@@ -1,0 +1,58 @@
+{
+  "description": "Staging Virt Cluster Z-Stream Upgrade (OCP 4.22.4 -> 4.22.12) with modern components",
+  "source_ocp": "4.22.4",
+  "target_ocp": "4.22.12",
+  "cluster_components": [
+    {
+      "name": "authentication",
+      "version": "4.22.4"
+    },
+    {
+      "name": "etcd",
+      "version": "4.22.4"
+    },
+    {
+      "name": "machine-config",
+      "version": "4.22.4"
+    },
+    {
+      "name": "storage",
+      "version": "4.22.4"
+    },
+    {
+      "name": "kubevirt-hyperconverged",
+      "version": "4.22.1"
+    },
+    {
+      "name": "mtv-operator",
+      "version": "2.11.8"
+    },
+    {
+      "name": "portworx-certified",
+      "version": "25.5.0"
+    },
+    {
+      "name": "dell-csm-operator-certified",
+      "version": "1.12.0"
+    },
+    {
+      "name": "vault-secrets-operator",
+      "version": "1.1.0"
+    },
+    {
+      "name": "px-cluster-dr",
+      "kind": "StorageCluster",
+      "namespace": "kube-system",
+      "spec_image": "portworx/oci-monitor:3.2.2",
+      "status_phase": "Online"
+    },
+    {
+      "name": "powerflex-dr",
+      "kind": "ContainerStorageModule",
+      "namespace": "dell-csm",
+      "driver_type": "vxflexos",
+      "config_version": "v2.13.0",
+      "status_state": "Succeeded"
+    }
+  ]
+}
