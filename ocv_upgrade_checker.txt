@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+import argparse
+from collections import deque
+import glob
+import json
+import os
+import re
+import sys
+import urllib.parse
+import urllib.request
+from packaging.version import InvalidVersion, Version
+
+OSUS_GRAPH_URL = "https://api.openshift.com/api/upgrades_info/v1/graph"
+PYXIS_BUNDLES_URL = "https://catalog.redhat.com/api/containers/v1/operators/bundles"
+
+# Session-level caches to optimize multi-scenario or multi-file runs
+_GRAPH_CACHE = {}
+_BUNDLE_CACHE = {}
+
+
+def fetch_json(url):
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def parse_ver(v_str):
+    if not v_str:
+        return Version("0.0.0")
+    clean = re.sub(r"^[^0-9]*", "", str(v_str)).split("-")[0]
+    try:
+        return Version(clean)
+    except InvalidVersion:
+        return Version("0.0.0")
+
+
+def extract_annotation(bundle, target_key):
+    raw = bundle.get("annotations")
+    if not raw:
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return None
+    if isinstance(raw, dict):
+        return raw.get(target_key)
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                if item.get("name") == target_key or item.get("key") == target_key:
+                    return item.get("value")
+                if target_key in item:
+                    return item[target_key]
+    return None
+
+
+def get_osus_graph(channel_minor):
+    if channel_minor not in _GRAPH_CACHE:
+        url = f"{OSUS_GRAPH_URL}?channel=stable-{channel_minor}&arch=amd64"
+        try:
+            _GRAPH_CACHE[channel_minor] = fetch_json(url)
+        except Exception:
+            _GRAPH_CACHE[channel_minor] = {}
+    return _GRAPH_CACHE[channel_minor]
+
+
+def find_shortest_ocp_path(src, tgt, src_minor, tgt_minor):
+    adj = {}
+    all_versions = set()
+
+    # Determine all minor channels to scan between src_minor and tgt_minor
+    try:
+        s_maj, s_min = map(int, src_minor.split(".")[:2])
+        t_maj, t_min = map(int, tgt_minor.split(".")[:2])
+        if s_maj == t_maj:
+            min_m, max_m = min(s_min, t_min), max(s_min, t_min)
+            channels = [f"{s_maj}.{m}" for m in range(min_m, max_m + 1)]
+        else:
+            channels = sorted({src_minor, tgt_minor})
+    except Exception:
+        channels = sorted({src_minor, tgt_minor})
+
+    for ch_minor in channels:
+        graph = get_osus_graph(ch_minor)
+        nodes = {i: n["version"] for i, n in enumerate(graph.get("nodes", []))}
+        all_versions.update(nodes.values())
+        for u, v in graph.get("edges", []):
+            u_ver, v_ver = nodes.get(u), nodes.get(v)
+            if u_ver and v_ver:
+                adj.setdefault(u_ver, set()).add(v_ver)
+
+    if src not in all_versions:
+        return f"BLOCKED_GRAPH: Source {src} not found in stable-{src_minor} or stable-{tgt_minor}."
+    if tgt not in all_versions:
+        return f"BLOCKED_GRAPH: Target {tgt} not found in stable-{tgt_minor}."
+
+    queue = deque([[src]])
+    visited = {src}
+    while queue:
+        path = queue.popleft()
+        curr = path[-1]
+        if curr == tgt:
+            hops = len(path) - 1
+            step_type = "DIRECT (1-Step Hop)" if hops == 1 else f"STEP-WISE ({hops}-Step Multi-Hop)"
+            return f"{step_type}: {' -> '.join(path)}"
+        for nxt in sorted(adj.get(curr, []), key=parse_ver, reverse=True):
+            if nxt not in visited:
+                visited.add(nxt)
+                queue.append(path + [nxt])
+
+    next_hops = sorted(adj.get(src, []), key=parse_ver)
+    return f"NO DIRECT/BRIDGE PATH TO {tgt} YET. Valid next hops from {src}: {', '.join(next_hops) or 'None'}"
+
+
+def validate_core_ocp_and_co(payload, core_ops):
+    src = payload["source_ocp"]
+    tgt = payload["target_ocp"]
+    src_minor = ".".join(src.split(".")[:2])
+    tgt_minor = ".".join(tgt.split(".")[:2])
+
+    graph_status = find_shortest_ocp_path(src, tgt, src_minor, tgt_minor)
+
+    co_blockers = []
+    for co_name, state in core_ops.items():
+        if isinstance(state, dict):
+            if state.get("version") and state.get("version") != src:
+                co_blockers.append(f"{co_name}: Version drift ({state.get('version')} != {src})")
+            if state.get("degraded"):
+                co_blockers.append(f"{co_name}: Operator is Degraded=True")
+            if not state.get("upgradeable", True):
+                co_blockers.append(f"{co_name}: Upgradeable=False ({state.get('reason', 'Guard active')})")
+
+    return graph_status, co_blockers
+
+
+def fetch_operator_bundles(pkg, src_minor, tgt_minor):
+    cache_key = (pkg, src_minor, tgt_minor)
+    if cache_key in _BUNDLE_CACHE:
+        return _BUNDLE_CACHE[cache_key]
+
+    rql = f"package=={pkg} and (ocp_version=={src_minor} or ocp_version=={tgt_minor})"
+    params = urllib.parse.urlencode({
+        "filter": rql,
+        "sort_by": "creation_date[desc]",
+        "page_size": 250,
+    })
+    try:
+        bundles = fetch_json(f"{PYXIS_BUNDLES_URL}?{params}").get("data", [])
+    except Exception:
+        bundles = []
+    _BUNDLE_CACHE[cache_key] = bundles
+    return bundles
+
+
+def evaluate_olm_operator(pkg, version_str, src_minor, tgt_minor, prefetched_bundles=None):
+    cur_ver = str(version_str).lstrip("v")
+    bundles = prefetched_bundles if prefetched_bundles is not None else fetch_operator_bundles(pkg, src_minor, tgt_minor)
+
+    if not bundles:
+        return {
+            "operator": pkg,
+            "organization": "community / external-helm",
+            "installed": f"v{cur_ver}",
+            "fix_before_upgrade": True,
+            "steps_required": "Manual K8s API / Helm Check",
+            "action": f"'{pkg}' not indexed in Red Hat/Certified catalogs for OCP {src_minor}/{tgt_minor}.",
+        }
+
+    org = bundles[0].get("organization", "unknown")
+    src_bundles = [b for b in bundles if b.get("ocp_version") == src_minor]
+    tgt_bundles = [b for b in bundles if b.get("ocp_version") == tgt_minor]
+
+    src_heads = {}
+    for b in src_bundles:
+        ch = b.get("channel_name")
+        if b.get("latest_in_channel") and ch and ch not in src_heads:
+            src_heads[ch] = b
+
+    tgt_heads = {}
+    for b in tgt_bundles:
+        ch = b.get("channel_name")
+        if b.get("latest_in_channel") and ch and ch not in tgt_heads:
+            tgt_heads[ch] = b
+
+    exact_in_tgt = [b for b in tgt_bundles if b.get("version") == cur_ver]
+    exact_in_src = [b for b in src_bundles if b.get("version") == cur_ver]
+
+    max_ocp = None
+    for b in exact_in_src + exact_in_tgt:
+        val = extract_annotation(b, "olm.maxOpenShiftVersion")
+        if val:
+            max_ocp = val
+            break
+
+    # Pick recommended target channel head: prefer highest version among default channels, or highest version overall
+    def_tgt_heads = [b for b in tgt_heads.values() if b.get("is_default_channel")]
+    if def_tgt_heads:
+        rec_tgt = sorted(def_tgt_heads, key=lambda x: parse_ver(x.get("version", "0")))[-1]
+    elif tgt_heads:
+        rec_tgt = sorted(tgt_heads.values(), key=lambda x: parse_ver(x.get("version", "0")))[-1]
+    else:
+        rec_tgt = None
+
+    rec_src = (
+        (src_heads.get(rec_tgt["channel_name"]) if rec_tgt else None)
+        or (sorted([b for b in src_heads.values() if b.get("is_default_channel")], key=lambda x: parse_ver(x.get("version", "0")))[-1] if any(b.get("is_default_channel") for b in src_heads.values()) else None)
+        or (sorted(src_heads.values(), key=lambda x: parse_ver(x.get("version", "0")))[-1] if src_heads else None)
+    )
+
+    max_ocp_blocks = bool(max_ocp and parse_ver(max_ocp) < parse_ver(tgt_minor))
+
+    if exact_in_tgt and not max_ocp_blocks:
+        return {
+            "operator": pkg,
+            "organization": org,
+            "installed": f"v{cur_ver}",
+            "fix_before_upgrade": False,
+            "steps_required": "0 Pre-Upgrade Steps",
+            "action": f"v{cur_ver} is certified in OCP {tgt_minor} ({org}).",
+        }
+
+    if not rec_tgt:
+        return {
+            "operator": pkg,
+            "organization": org,
+            "installed": f"v{cur_ver}",
+            "fix_before_upgrade": True,
+            "steps_required": "Blocked (No Target Bundle)",
+            "action": f"No bundle published yet for '{pkg}' in OCP {tgt_minor} catalog.",
+        }
+
+    src_ver = rec_src["version"] if rec_src else "N/A"
+    src_ch = rec_src["channel_name"] if rec_src else "stable"
+    tgt_ver = rec_tgt["version"]
+    tgt_ch = rec_tgt["channel_name"]
+    ceiling_note = f" [maxOCP={max_ocp}]" if max_ocp else ""
+
+    steps = f"Pre-Upgrade Update Required{ceiling_note}"
+    if src_minor == tgt_minor:
+        action = f"Update operator to v{tgt_ver} in channel '{tgt_ch}'."
+    elif src_ver == tgt_ver and src_ch == tgt_ch:
+        action = f"[On OCP {src_minor}] Update operator to v{src_ver} in channel '{src_ch}' (certified for OCP {tgt_minor})."
+    else:
+        action = (
+            f"[On OCP {src_minor}] Update operator to v{src_ver} in channel '{src_ch}'. "
+            f"[After OCP {tgt_minor} Upgrade] Update to v{tgt_ver} (channel '{tgt_ch}')."
+        )
+
+    return {
+        "operator": pkg,
+        "organization": org,
+        "installed": f"v{cur_ver}",
+        "fix_before_upgrade": True,
+        "steps_required": steps,
+        "action": action,
+    }
+
+
+def extract_alm_storage_specs(bundles, tgt_minor):
+    discovered = {"px_images": set(), "dell_configs": {}}
+    tgt_bundles = [b for b in bundles if b.get("ocp_version") == tgt_minor]
+    if not tgt_bundles:
+        tgt_bundles = bundles
+
+    for b in tgt_bundles:
+        raw_alm = b.get("alm_examples")
+        if not raw_alm:
+            continue
+        try:
+            examples = json.loads(raw_alm) if isinstance(raw_alm, str) else raw_alm
+            if not isinstance(examples, list):
+                examples = [examples]
+            for ex in examples:
+                if not isinstance(ex, dict):
+                    continue
+                kind = ex.get("kind", "")
+                spec = ex.get("spec", {})
+                if not isinstance(spec, dict):
+                    continue
+
+                if kind == "StorageCluster":
+                    img = spec.get("image")
+                    if img:
+                        discovered["px_images"].add(img)
+                elif kind == "ContainerStorageModule":
+                    drv = spec.get("driver", {})
+                    if isinstance(drv, dict):
+                        dtype = drv.get("csiDriverType", "generic").lower()
+                        cver = drv.get("configVersion")
+                        if cver:
+                            discovered["dell_configs"].setdefault(dtype, set()).add(cver)
+                            if dtype == "vxflexos":
+                                discovered["dell_configs"].setdefault("powerflex", set()).add(cver)
+                            elif dtype == "powerflex":
+                                discovered["dell_configs"].setdefault("vxflexos", set()).add(cver)
+        except Exception:
+            continue
+
+    # Fallback to top-level version only if no driver configVersion was found
+    if not discovered["dell_configs"]:
+        for b in tgt_bundles:
+            raw_alm = b.get("alm_examples")
+            if not raw_alm:
+                continue
+            try:
+                examples = json.loads(raw_alm) if isinstance(raw_alm, str) else raw_alm
+                if not isinstance(examples, list):
+                    examples = [examples]
+                for ex in examples:
+                    if isinstance(ex, dict) and ex.get("kind") == "ContainerStorageModule":
+                        drv = ex.get("spec", {}).get("driver", {})
+                        dtype = drv.get("csiDriverType", "generic").lower() if isinstance(drv, dict) else "generic"
+                        cver = ex.get("version") or ex.get("spec", {}).get("version")
+                        if cver:
+                            discovered["dell_configs"].setdefault(dtype, set()).add(cver)
+                            if dtype == "vxflexos":
+                                discovered["dell_configs"].setdefault("powerflex", set()).add(cver)
+                            elif dtype == "powerflex":
+                                discovered["dell_configs"].setdefault("vxflexos", set()).add(cver)
+            except Exception:
+                continue
+
+    return discovered
+
+
+def validate_storage_crs(storage_crs_list, px_bundles, csm_bundles, src_minor, tgt_minor):
+    findings = []
+    px_crs = [c for c in storage_crs_list if c.get("kind") == "StorageCluster"]
+    csm_crs = [c for c in storage_crs_list if c.get("kind") == "ContainerStorageModule"]
+
+    px_alm = extract_alm_storage_specs(px_bundles, tgt_minor)
+    px_vers = sorted([parse_ver(img.split(":")[-1]) for img in px_alm["px_images"] if ":" in img])
+    min_px = px_vers[0] if px_vers else parse_ver("0.0.0")
+    rec_px = px_vers[-1] if px_vers else min_px
+
+    for cr in px_crs:
+        img = cr.get("spec_image", "")
+        cur_ver = parse_ver(img.split(":")[-1] if ":" in img else img)
+        phase = cr.get("status_phase", "Unknown")
+        reasons = []
+        if phase != "Online":
+            reasons.append(f"Phase is '{phase}' (expected 'Online')")
+        if min_px > Version("0.0.0") and cur_ver < min_px:
+            reasons.append(f"Engine '{img}' (v{cur_ver}) < OCP {tgt_minor} minimum (v{min_px})")
+
+        rec_patch = f"portworx/oci-monitor:{rec_px}" if rec_px > Version("0.0.0") else img
+        ns = cr.get("namespace", "default")
+        findings.append({
+            "cr": f"StorageCluster/{cr['name']} (ns: {ns})",
+            "installed": img,
+            "fix_before_upgrade": bool(reasons),
+            "reason": "; ".join(reasons) if reasons else f"Engine v{cur_ver} complies with OCP {tgt_minor} requirements.",
+            "action": f"Patch StorageCluster '{cr['name']}' spec.image to '{rec_patch}'." if reasons else "None.",
+        })
+
+    csm_alm = extract_alm_storage_specs(csm_bundles, tgt_minor)
+    for cr in csm_crs:
+        dtype = cr.get("driver_type", "unknown").lower()
+        cver_str = cr.get("config_version", "v0.0.0")
+        cur_ver = parse_ver(cver_str)
+        state = cr.get("status_state", "Unknown")
+
+        canonical_dtype = "powerflex" if dtype == "vxflexos" else dtype
+        available_configs = csm_alm["dell_configs"].get(dtype, set()) | csm_alm["dell_configs"].get(canonical_dtype, set())
+        drv_vers = sorted([parse_ver(v) for v in available_configs])
+        min_csm = drv_vers[0] if drv_vers else parse_ver("0.0.0")
+        rec_csm = drv_vers[-1] if drv_vers else min_csm
+
+        reasons = []
+        if state != "Succeeded":
+            reasons.append(f"CSM state is '{state}' (expected 'Succeeded')")
+        if min_csm > Version("0.0.0") and cur_ver < min_csm:
+            reasons.append(f"Driver '{dtype}' configVersion '{cver_str}' < OCP {tgt_minor} minimum (v{min_csm})")
+
+        rec_patch = f"v{rec_csm}" if rec_csm > Version("0.0.0") else cver_str
+        ns = cr.get("namespace", "default")
+        findings.append({
+            "cr": f"ContainerStorageModule/{cr['name']} ({dtype}, ns: {ns})",
+            "installed": cver_str,
+            "fix_before_upgrade": bool(reasons),
+            "reason": "; ".join(reasons) if reasons else f"configVersion '{cver_str}' supported in OCP {tgt_minor}.",
+            "action": f"Patch CSM CR '{cr['name']}' spec.driver.configVersion -> '{rec_patch}'." if reasons else "None.",
+        })
+
+    return findings
+
+
+# Well-known OpenShift core ClusterOperators managed by CVO
+KNOWN_CORE_OPERATORS = {
+    "authentication", "baremetal", "cloud-controller-manager", "cloud-credential",
+    "cluster-autoscaler", "config-operator", "console", "control-plane-machine-set",
+    "csi-snapshot-controller", "dns", "etcd", "image-registry", "ingress", "insights",
+    "kube-apiserver", "kube-controller-manager", "kube-scheduler",
+    "kube-storage-version-migrator", "machine-api", "machine-approver",
+    "machine-config", "marketplace", "monitoring", "network", "node-tuning",
+    "openshift-apiserver", "openshift-controller-manager", "openshift-samples",
+    "operator-lifecycle-manager", "operator-lifecycle-manager-catalog",
+    "operator-lifecycle-manager-packageserver", "service-ca", "storage",
+}
+
+
+def parse_payload_components(payload):
+    components = payload.get("cluster_components", [])
+    core_ops = {}
+    olm_ops = {}
+    storage_crs_list = []
+
+    for c in components:
+        if not isinstance(c, dict):
+            continue
+        c_type = c.get("type")
+        c_name = c.get("name", "")
+
+        # Infer component type if 'type' key is omitted
+        if not c_type:
+            if c.get("kind") in ("StorageCluster", "ContainerStorageModule") or "spec_image" in c or "driver_type" in c:
+                c_type = "storage_cr"
+            elif c_name in KNOWN_CORE_OPERATORS or "degraded" in c or "upgradeable" in c:
+                c_type = "core_operator"
+            else:
+                c_type = "olm_operator"
+
+        if c_type == "core_operator":
+            core_ops[c_name] = c
+        elif c_type == "olm_operator":
+            olm_ops[c_name] = c.get("version", "0.0.0")
+        elif c_type == "storage_cr":
+            storage_crs_list.append(c)
+
+    # Support categorized dict payload (e.g. core_operators, olm_operators, storage_custom_resources)
+    if not core_ops and "core_operators" in payload:
+        core_ops = payload["core_operators"]
+    if not olm_ops and "olm_operators" in payload:
+        for pkg, data in payload["olm_operators"].items():
+            if isinstance(data, dict):
+                olm_ops[pkg] = data.get("version", "0.0.0")
+            else:
+                olm_ops[pkg] = str(data)
+    if not storage_crs_list and "storage_custom_resources" in payload:
+        storage_section = payload["storage_custom_resources"]
+        for item in storage_section.get("portworx_storage_clusters", []):
+            item_copy = dict(item)
+            item_copy.setdefault("type", "storage_cr")
+            item_copy.setdefault("kind", "StorageCluster")
+            storage_crs_list.append(item_copy)
+        for item in storage_section.get("dell_csm_instances", []):
+            item_copy = dict(item)
+            item_copy.setdefault("type", "storage_cr")
+            item_copy.setdefault("kind", "ContainerStorageModule")
+            storage_crs_list.append(item_copy)
+
+    return core_ops, olm_ops, storage_crs_list
+
+
+TOOL_SCHEMA = {
+    "name": "ocv_upgrade_checker",
+    "description": "Validates OpenShift cluster upgrade paths via Cincinnati OSUS Graph API, OLM operator compatibility via Red Hat Pyxis API, and Portworx/Dell CSM storage data-plane CR compatibility.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "source_ocp": {
+                "type": "string",
+                "description": "Source OpenShift version (e.g. '4.21.12')"
+            },
+            "target_ocp": {
+                "type": "string",
+                "description": "Target OpenShift version (e.g. '4.22.12')"
+            },
+            "cluster_components": {
+                "type": "array",
+                "description": "List of core operators, OLM operators, and storage CRs in the cluster.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Component or package name"},
+                        "type": {"type": "string", "enum": ["core_operator", "olm_operator", "storage_cr"], "description": "Optional component type (auto-inferred if omitted)"},
+                        "version": {"type": "string", "description": "Installed version"},
+                        "kind": {"type": "string", "description": "For storage CRs: StorageCluster or ContainerStorageModule"},
+                        "namespace": {"type": "string", "description": "Namespace"},
+                        "spec_image": {"type": "string", "description": "For StorageCluster: container image (e.g. portworx/oci-monitor:3.1.1)"},
+                        "status_phase": {"type": "string", "description": "For StorageCluster: status phase (e.g. Online)"},
+                        "driver_type": {"type": "string", "description": "For ContainerStorageModule: powerstore, powerflex, vxflexos, unity, etc."},
+                        "config_version": {"type": "string", "description": "For ContainerStorageModule: configVersion (e.g. v2.14.0)"},
+                        "status_state": {"type": "string", "description": "For ContainerStorageModule: status state (e.g. Succeeded)"},
+                        "degraded": {"type": "boolean", "description": "For core operators: true if degraded"},
+                        "upgradeable": {"type": "boolean", "description": "For core operators: false if upgrade is blocked"},
+                        "reason": {"type": "string", "description": "Reason message if degraded or not upgradeable"}
+                    },
+                    "required": ["name"]
+                }
+            }
+        },
+        "required": ["source_ocp", "target_ocp", "cluster_components"]
+    }
+}
+
+
+def run_validation(cluster_name, payload, full_report=False, tool_calling=False):
+    src_full = payload["source_ocp"]
+    tgt_full = payload["target_ocp"]
+    src_minor = ".".join(src_full.split(".")[:2])
+    tgt_minor = ".".join(tgt_full.split(".")[:2])
+
+    core_ops, olm_ops, storage_crs_list = parse_payload_components(payload)
+    graph_status, co_blockers = validate_core_ocp_and_co(payload, core_ops)
+
+    bundle_cache = {}
+    olm_results = []
+    for pkg, version_str in olm_ops.items():
+        bundles = fetch_operator_bundles(pkg, src_minor, tgt_minor)
+        bundle_cache[pkg] = bundles
+        olm_results.append(evaluate_olm_operator(pkg, version_str, src_minor, tgt_minor, bundles))
+
+    fix_required_ops = [r for r in olm_results if r["fix_before_upgrade"]]
+    ready_ops_count = len(olm_results) - len(fix_required_ops)
+    displayed_ops = olm_results if full_report else fix_required_ops
+
+    cr_results = []
+    cr_fix_required = []
+    cr_ready_count = 0
+    if storage_crs_list:
+        cr_results = validate_storage_crs(
+            storage_crs_list,
+            bundle_cache.get("portworx-certified", fetch_operator_bundles("portworx-certified", src_minor, tgt_minor)),
+            bundle_cache.get("dell-csm-operator-certified", fetch_operator_bundles("dell-csm-operator-certified", src_minor, tgt_minor)),
+            src_minor,
+            tgt_minor,
+        )
+        cr_fix_required = [res for res in cr_results if res["fix_before_upgrade"]]
+        cr_ready_count = len(cr_results) - len(cr_fix_required)
+
+    has_path = graph_status.startswith("DIRECT") or graph_status.startswith("STEP-WISE")
+    action_plan = []
+    if not has_path:
+        action_plan.append(f"Wait for Cincinnati graph bridge or hop via intermediate release: {graph_status}")
+    for b in co_blockers:
+        action_plan.append(f"Resolve Core CO blocker: {b}")
+    for r in fix_required_ops:
+        action_plan.append(r["action"])
+    for cr in cr_fix_required:
+        action_plan.append(cr["action"])
+
+    resolved_cluster_name = payload.get("cluster_name") or payload.get("name") or cluster_name
+
+    structured_result = {
+        "cluster": resolved_cluster_name,
+        "description": payload.get("description", ""),
+        "source_ocp": src_full,
+        "target_ocp": tgt_full,
+        "upgradeable": bool(has_path and not co_blockers and not fix_required_ops and not cr_fix_required),
+        "summary": {
+            "release_path_status": "AVAILABLE" if has_path else "BLOCKED_OR_STEP_REQUIRED",
+            "core_co_blockers_count": len(co_blockers),
+            "olm_fixes_required_count": len(fix_required_ops),
+            "storage_fixes_required_count": len(cr_fix_required),
+            "total_fixes_required": len(action_plan)
+        },
+        "osus_release_path": {
+            "status": graph_status,
+            "has_path": has_path
+        },
+        "core_cluster_operators": {
+            "status": "BLOCKED" if co_blockers else "READY",
+            "blockers": co_blockers
+        },
+        "olm_operators": {
+            "status": "BLOCKED" if fix_required_ops else "READY",
+            "fixes_required": fix_required_ops,
+            "ready_for_upgrade": [r for r in olm_results if not r["fix_before_upgrade"]] if full_report else ready_ops_count
+        },
+        "storage_crs": {
+            "status": "BLOCKED" if cr_fix_required else "READY",
+            "fixes_required": cr_fix_required,
+            "ready_for_upgrade": [r for r in cr_results if not r["fix_before_upgrade"]] if full_report else cr_ready_count
+        } if storage_crs_list else None,
+        "action_plan": action_plan
+    }
+
+    if not tool_calling:
+        print("=" * 98)
+        print(f"CLUSTER  : {resolved_cluster_name}")
+        if "description" in payload:
+            print(f"SUMMARY  : {payload['description']}")
+        print(f"UPGRADE  : OCP {src_full} ({src_minor}) ---> OCP {tgt_full} ({tgt_minor})")
+        print("=" * 98)
+
+        print("\n[1] CORE PLATFORM & CVO CLUSTEROPERATORS (OSUS Graph API)")
+        print(f"    OSUS Release Path : {graph_status}")
+        if co_blockers:
+            print("    Core CO Blockers  : [FIX REQUIRED BEFORE UPGRADE]")
+            for b in co_blockers:
+                print(f"      - {b}")
+        else:
+            print("    Core CO Blockers  : None (All Core ClusterOperators healthy)")
+
+        print("\n[2] OLM OPERATORS: RED HAT, STORAGE & THIRD-PARTY (Pyxis Catalog API)")
+        print("-" * 98)
+
+        if displayed_ops:
+            for r in displayed_ops:
+                flag = "[FIX PRIOR TO UPGRADE]" if r["fix_before_upgrade"] else "[READY FOR UPGRADE]"
+                print(f"* {r['operator']:<28} | Org: {r['organization']:<19} | Installed: {r['installed']:<12} -> {flag}")
+                print(f"  Steps  : {r['steps_required']}")
+                print(f"  Action : {r['action']}\n")
+
+        if not full_report:
+            if not fix_required_ops:
+                print(f"  None. All {len(olm_results)} OLM operator(s) are [READY FOR UPGRADE]. (Use --full-report for details)\n")
+            elif ready_ops_count > 0:
+                print(f"  ({ready_ops_count} operator(s) [READY FOR UPGRADE] hidden. Use --full-report to show all.)\n")
+
+        if storage_crs_list:
+            print("[3] STORAGE LAYER-2 DATA-PLANE CRS (Portworx StorageCluster & Dell CSM)")
+            print("-" * 98)
+            displayed_crs = cr_results if full_report else cr_fix_required
+
+            if displayed_crs:
+                for res in displayed_crs:
+                    badge = "[FIX PRIOR TO UPGRADE]" if res["fix_before_upgrade"] else "[READY FOR UPGRADE]"
+                    print(f"* {res['cr']:<56} | Installed: {res['installed']:<24} -> {badge}")
+                    print(f"  Reason : {res['reason']}")
+                    print(f"  Action : {res['action']}\n")
+
+            if not full_report:
+                if not cr_fix_required:
+                    print(f"  None. All {len(cr_results)} storage CR(s) are [READY FOR UPGRADE]. (Use --full-report for details)\n")
+                elif cr_ready_count > 0:
+                    print(f"  ({cr_ready_count} storage CR(s) [READY FOR UPGRADE] hidden. Use --full-report to show all.)\n")
+        print("\n")
+
+    return structured_result
+
+
+def process_file(file_path, full_report=False, tool_calling=False):
+    if not os.path.exists(file_path):
+        if not tool_calling:
+            print(f"Error: File '{file_path}' does not exist.", file=sys.stderr)
+        return []
+
+    if not tool_calling:
+        print(f"\n>>> Processing cluster file: {file_path}")
+    with open(file_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    results = []
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+
+    # Real cluster data: top-level cluster specification
+    if "source_ocp" in data and "target_ocp" in data:
+        cluster_name = data.get("cluster_name") or data.get("name") or base_name
+        results.append(run_validation(cluster_name, data, full_report=full_report, tool_calling=tool_calling))
+    else:
+        # Multiple cluster dictionaries defined in a single file
+        for name, payload in data.items():
+            if isinstance(payload, dict) and "source_ocp" in payload:
+                results.append(run_validation(name, payload, full_report=full_report, tool_calling=tool_calling))
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Validate OpenShift Cluster & Operator Upgrade Compatibility")
+    parser.add_argument("files", nargs="*", help="Path to JSON file(s) containing cluster data")
+    parser.add_argument("-f", "--file", action="append", help="Path to JSON file containing cluster data")
+    parser.add_argument("--full-report", action="store_true", help="Show status of all operators and storage CRs including those ready for upgrade")
+    parser.add_argument(
+        "--tool-calling", "---tool-calling", "--json",
+        action="store_true",
+        dest="tool_calling",
+        help="Enable machine-readable JSON tool output mode for AI agents"
+    )
+    parser.add_argument("--payload", help="Direct JSON payload string for agent tool calling")
+    parser.add_argument("--tool-schema", action="store_true", help="Print tool calling JSON schema specification")
+    args = parser.parse_args()
+
+    if args.tool_schema:
+        print(json.dumps(TOOL_SCHEMA, indent=2))
+        sys.exit(0)
+
+    if args.payload:
+        try:
+            payload = json.loads(args.payload)
+        except Exception as e:
+            if args.tool_calling:
+                print(json.dumps({"error": f"Invalid JSON payload: {e}"}))
+            else:
+                print(f"Error parsing --payload JSON: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        result = run_validation("agent_cluster_call", payload, full_report=args.full_report, tool_calling=True)
+        print(json.dumps(result, indent=2))
+        sys.exit(0)
+
+    target_files = []
+    if args.file:
+        target_files.extend(args.file)
+    if args.files:
+        target_files.extend(args.files)
+
+    if not target_files:
+        # Default fallback: scan for version_testing*.json in current directory
+        discovered = sorted(glob.glob("version_testing*.json"))
+        if discovered:
+            target_files = discovered
+        elif os.path.exists("version_testing.json"):
+            target_files = ["version_testing.json"]
+        else:
+            parser.print_help()
+            sys.exit(1)
+
+    all_results = []
+    for fpath in target_files:
+        res = process_file(fpath, full_report=args.full_report, tool_calling=args.tool_calling)
+        all_results.extend(res)
+
+    if args.tool_calling:
+        output = all_results[0] if len(all_results) == 1 else all_results
+        print(json.dumps(output, indent=2))
+
+
+if __name__ == "__main__":
+    main()
