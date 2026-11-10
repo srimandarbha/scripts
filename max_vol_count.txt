@@ -1,0 +1,7 @@
+(
+          sum by (node) (kube_pod_info{namespace=~".*"} * on(pod, namespace) group_right(node) kube_pod_container_status_running)
+          # OR use your preferred active volume count metric below:
+          # sum by (node) (kube_persistentvolumeclaim_resource_requests_storage_bytes)
+        ) 
+        / 
+        60 > 0.9
