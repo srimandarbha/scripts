@@ -1,0 +1,9 @@
+count by (node, storageclass) (
+  (
+    kube_pod_spec_volumes_persistentvolumeclaims_info
+    * on (namespace, pod) group_left (node)
+    kube_pod_info
+  )
+  * on (namespace, persistentvolumeclaim) group_left (storageclass)
+  kube_persistentvolumeclaim_info
+)
