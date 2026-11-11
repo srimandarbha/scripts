@@ -1,0 +1,5 @@
+count by (node, storageclass) (
+  (kube_volumeattachment_info * on (volumeattachment) group_left () kube_volumeattachment_spec_source_persistentvolume)
+  * on (volumename) group_left (storageclass)
+  label_replace(kube_persistentvolume_info, "volumename", "$1", "persistentvolume", "(.+)")
+)
