@@ -1,0 +1,3 @@
+I have 150+ openshift virtualization clusters and we get argocdsync alert comes for various issues either due to sync issues, reposerver not syncing variables to argocd, or sometimes suggest hard refresh, sometime the git reversion is old, it could be missing, unknown, degraded issues for argocd. Refer the argocd documentation and redhat solutions/articles and create skill.md , references, argocd which should use metrics , logs or k8sobjects only to troubleshoot this issue. Make sure to provide k8sobject list needed for this use case.
+
+Make sure to take this repo as reference and create skill folder with skill.md, references, scripts
