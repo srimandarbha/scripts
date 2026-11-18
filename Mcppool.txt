@@ -1,0 +1,5 @@
+oc get nodes -l node-role.kubernetes.io/<pool-name> -o custom-columns=\
+NAME:.metadata.name,\
+CURRENT:.metadata.annotations.machineconfiguration\.openshift\.io/currentConfig,\
+DESIRED:.metadata.annotations.machineconfiguration\.openshift\.io/desiredConfig,\
+STATE:.metadata.annotations.machineconfiguration\.openshift\.io/state
